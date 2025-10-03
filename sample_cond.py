@@ -8,20 +8,16 @@ import torch
 import math
 import json
 
-from main_cond import UNet, Diffusion   # main.py에 정의된 클래스/함수 불러오기
+from main_cond import UNet, Diffusion   # main_cond.py에 정의된 UNet, Diffusion 불러오기
 
 
+# ----------------------------
+# 모델 로드 함수
+# ----------------------------
 def load_model(ckpt_path, device="cuda", base_ch=32, timesteps=300, num_classes=10):
-    """
-    조건부 Diffusion 모델 로드 함수
-    ckpt_path: 체크포인트 파일 경로 (.pt)
-    num_classes: cond2idx.json에 정의된 condition 개수
-    """
-    # 모델 초기화 (조건 개수 반영)
     model = UNet(in_ch=1, out_ch=1, base_ch=base_ch, num_classes=num_classes).to(device)
     diffusion = Diffusion(timesteps=timesteps, device=device)
 
-    # 체크포인트 로드
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -30,17 +26,18 @@ def load_model(ckpt_path, device="cuda", base_ch=32, timesteps=300, num_classes=
     return model, diffusion, ckpt
 
 
-# =====================
-# 샘플 생성 함수
-# =====================
+# ----------------------------
+# 조건부 샘플 생성 함수
+# ----------------------------
 @torch.no_grad()
-def sample(model, diffusion, shape=(1, 1, 129, 376),
-           device="cuda", min_db=-80, max_db=0, is_phase=False):
+def sample_cond(model, diffusion, cond, shape=(1, 1, 129, 376),
+                device="cuda", min_db=-80, max_db=0, is_phase=False):
     img = torch.randn(shape, device=device)
 
     for t in reversed(range(diffusion.timesteps)):
         t_tensor = torch.tensor([t], device=device).long()
-        noise_pred = model(img, t_tensor)
+        cond_tensor = torch.tensor([cond], device=device).long()
+        noise_pred = model(img, t_tensor, cond_tensor)  # ✅ 조건부 호출
         alpha = diffusion.alphas[t]
         alpha_hat = diffusion.alpha_hat[t]
         beta = diffusion.betas[t]
@@ -56,12 +53,15 @@ def sample(model, diffusion, shape=(1, 1, 129, 376),
     else:
         # (1) [-1,1] → [min_db, max_db]
         spec_db = (img + 1) / 2 * (max_db - min_db) + min_db
-
         # (2) dB → magnitude
         img = 10 ** (spec_db / 20)
 
     return img
 
+
+# ----------------------------
+# 메인 실행
+# ----------------------------
 def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.out_dir, exist_ok=True)
@@ -91,7 +91,7 @@ def main(args):
             raise ValueError(f"⚠️ condition '{args.condition}' not found in {cond_map_path}")
         conditions_to_generate = [args.condition]
 
-    # === 각 condition에 대해 샘플 생성 ===
+    # === 각 condition별 샘플 생성 ===
     for cond_name in conditions_to_generate:
         cond_idx = cond_map[cond_name]
         cond_out_dir = os.path.join(args.out_dir, cond_name)
@@ -99,12 +99,12 @@ def main(args):
 
         print(f"\n=== Generating for condition: {cond_name} (idx={cond_idx}) ===")
         for i in range(args.num_samples):
-            spec = sample(model, diffusion, cond=cond_idx,
-                          shape=(1, 1, 129, 376),
-                          device=device,
-                          min_db=args.min_db,
-                          max_db=args.max_db,
-                          is_phase=args.is_phase)
+            spec = sample_cond(model, diffusion, cond=cond_idx,
+                               shape=(1, 1, 129, 376),
+                               device=device,
+                               min_db=args.min_db,
+                               max_db=args.max_db,
+                               is_phase=args.is_phase)
 
             # 저장 (npy + png)
             np.save(f"{cond_out_dir}/sample_{i+1:03d}.npy", spec)

@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import torch
 import math
 
-from main import UNet, Diffusion   # main.py에 정의된 클래스/함수 불러오기
+from main_uncond import UNet, Diffusion   # main.py에 정의된 클래스/함수 불러오기
 
 
 def load_model(ckpt_path, device="cuda", base_ch=32, timesteps=300):

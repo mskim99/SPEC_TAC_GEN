@@ -1,57 +1,21 @@
-import matplotlib
-matplotlib.use("Agg")
-
-import sys
 import os
-import argparse
 import math
+import argparse
 import numpy as np
-import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from datetime import datetime
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-from dataset import SpectrogramDataset   # ✅ 분리된 dataset 불러오기
-
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]= "1"
-
-
-def setup_logger(log_path):
-    class Logger(object):
-        def __init__(self, log_path):
-            self.terminal = sys.stdout
-            self.log = open(log_path, "a")
-
-        def write(self, message):
-            self.terminal.write(message)
-            self.log.write(message)
-
-        def flush(self):
-            self.terminal.flush()
-            self.log.flush()
-
-    sys.stdout = Logger(log_path)
-    sys.stderr = sys.stdout
+from dataset import SpectrogramDataset   # ✅ dataset.py 불러오기
 
 
-def log_training_params(log_path, args):
-    with open(log_path, "a") as f:
-        f.write(f"\n==== New Run: {datetime.now()} ====\n")
-        for k, v in vars(args).items():
-            f.write(f"  {k:12s}: {v}\n")
-        f.write("\n")
-
-
-def log_loss(epoch, loss_value):
-    print(f"[Epoch {epoch}] - Loss: {loss_value:.6f}")
-
-
-# ---------------------
-# Conv Block & UNet
-# ---------------------
+# =====================
+# UNet 모델
+# =====================
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -63,75 +27,69 @@ class ConvBlock(nn.Module):
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
         )
+
     def forward(self, x):
         return self.block(x)
 
 
-def sinusoidal_embedding(timesteps, dim=128):
-    device = timesteps.device
-    half_dim = dim // 2
-    emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
-    emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-    emb = timesteps[:, None].float() * emb[None, :]
-    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
-    return emb
-
-
 class UNet(nn.Module):
-    def __init__(self, in_ch=1, out_ch=1, base_ch=32, num_classes=10, emb_dim=128):
+    def __init__(self, in_ch=1, out_ch=1, base_ch=32):
         super().__init__()
         self.enc1 = ConvBlock(in_ch, base_ch)
         self.pool1 = nn.MaxPool2d(2)
+
         self.enc2 = ConvBlock(base_ch, base_ch*2)
         self.pool2 = nn.MaxPool2d(2)
+
         self.enc3 = ConvBlock(base_ch*2, base_ch*4)
         self.pool3 = nn.MaxPool2d(2)
+
         self.bottleneck = ConvBlock(base_ch*4, base_ch*8)
 
         self.up3 = nn.ConvTranspose2d(base_ch*8, base_ch*4, kernel_size=2, stride=2)
         self.dec3 = ConvBlock(base_ch*8, base_ch*4)
+
         self.up2 = nn.ConvTranspose2d(base_ch*4, base_ch*2, kernel_size=2, stride=2)
         self.dec2 = ConvBlock(base_ch*4, base_ch*2)
+
         self.up1 = nn.ConvTranspose2d(base_ch*2, base_ch, kernel_size=2, stride=2)
         self.dec1 = ConvBlock(base_ch*2, base_ch)
 
         self.out_conv = nn.Conv2d(base_ch, out_ch, kernel_size=1)
 
-        # Embedding
-        self.cond_emb = nn.Embedding(num_classes, emb_dim)
-        self.fc = nn.Linear(emb_dim*2, base_ch*8)
+    def forward(self, x, t=None):
+        e1 = self.enc1(x)
+        p1 = self.pool1(e1)
 
-    def forward(self, x, t=None, cond=None):
-        e1 = self.enc1(x); p1 = self.pool1(e1)
-        e2 = self.enc2(p1); p2 = self.pool2(e2)
-        e3 = self.enc3(p2); p3 = self.pool3(e3)
+        e2 = self.enc2(p1)
+        p2 = self.pool2(e2)
+
+        e3 = self.enc3(p2)
+        p3 = self.pool3(e3)
+
         b = self.bottleneck(p3)
-
-        if t is not None and cond is not None:
-            t_emb = sinusoidal_embedding(t, dim=self.cond_emb.embedding_dim)
-            c_emb = self.cond_emb(cond)
-            joint_emb = torch.cat([t_emb, c_emb], dim=1)
-            joint_vec = self.fc(joint_emb)
-            joint_vec = joint_vec[:, :, None, None]
-            b = b + joint_vec
 
         u3 = self.up3(b)
         u3 = F.interpolate(u3, size=e3.shape[2:], mode="bilinear", align_corners=False)
         d3 = self.dec3(torch.cat([u3, e3], dim=1))
+
         u2 = self.up2(d3)
         u2 = F.interpolate(u2, size=e2.shape[2:], mode="bilinear", align_corners=False)
         d2 = self.dec2(torch.cat([u2, e2], dim=1))
+
         u1 = self.up1(d2)
         u1 = F.interpolate(u1, size=e1.shape[2:], mode="bilinear", align_corners=False)
         d1 = self.dec1(torch.cat([u1, e1], dim=1))
+
         return self.out_conv(d1)
 
 
-# ---------------------
-# Diffusion
-# ---------------------
+# =====================
+# Diffusion Utilities
+# =====================
 def linear_beta_schedule(timesteps, start=1e-4, end=0.02):
     return torch.linspace(start, end, timesteps)
+
 
 class Diffusion:
     def __init__(self, timesteps=300, device="cuda"):
@@ -148,43 +106,42 @@ class Diffusion:
         return sqrt_alpha_hat * x0 + sqrt_one_minus_alpha_hat * noise, noise
 
 
-# ---------------------
-# Train
-# ---------------------
-def train_diffusion(is_phase, data_dir, epochs=10, batch_size=16, lr=1e-4,
-                    timesteps=300, base_ch=32, ckpt_dir="checkpoints",
-                    device="cuda", save_interval=5):
+# =====================
+# 학습 루프
+# =====================
+def train_diffusion(data_dir, is_phase=False, epochs=10, batch_size=16, lr=1e-4,
+                    timesteps=300, base_ch=32, device="cuda",
+                    ckpt_dir="checkpoints", save_interval=5):
 
     os.makedirs(ckpt_dir, exist_ok=True)
 
     dataset = SpectrogramDataset(data_dir, is_phase=is_phase)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    num_classes = len(dataset.cond2idx)
-
-    # cond2idx 저장
-    cond_map_path = os.path.join(ckpt_dir, "cond2idx.json")
-    with open(cond_map_path, "w") as f:
-        json.dump(dataset.cond2idx, f, indent=4)
 
     in_ch = 2 if is_phase else 1
     out_ch = 2 if is_phase else 1
-    model = UNet(in_ch=in_ch, out_ch=out_ch, base_ch=base_ch, num_classes=num_classes).to(device)
+    model = UNet(in_ch=in_ch, out_ch=out_ch, base_ch=base_ch).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     mse = nn.MSELoss()
+
     diffusion = Diffusion(timesteps=timesteps, device=device)
 
     for epoch in range(epochs):
-        for step, (x, cond) in enumerate(dataloader):
-            x, cond = x.to(device), cond.to(device)
+        for step, x in enumerate(dataloader):
+            x = x.to(device)
             t = torch.randint(0, diffusion.timesteps, (x.shape[0],), device=device).long()
+
             noisy_x, noise = diffusion.add_noise(x, t)
-            noise_pred = model(noisy_x, t, cond)
+            noise_pred = model(noisy_x, t)
+
             loss = mse(noise_pred, noise)
 
-            optimizer.zero_grad(); loss.backward(); optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        log_loss(epoch+1, loss.item())
+        print(f"Epoch [{epoch+1}/{epochs}] Loss: {loss.item():.4f}")
 
         if (epoch + 1) % save_interval == 0 or (epoch + 1) == epochs:
             ckpt_path = os.path.join(ckpt_dir, f"ckpt_epoch_{epoch+1:04d}.pt")
@@ -199,43 +156,74 @@ def train_diffusion(is_phase, data_dir, epochs=10, batch_size=16, lr=1e-4,
     return model, diffusion
 
 
-# ---------------------
-# Main
-# ---------------------
+# =====================
+# 샘플 생성
+# =====================
+@torch.no_grad()
+def sample(model, diffusion, shape=(1, 1, 129, 376), device="cuda",
+           min_db=-80, max_db=0, is_phase=False):
+    img = torch.randn(shape, device=device)
+
+    for t in reversed(range(diffusion.timesteps)):
+        t_tensor = torch.tensor([t], device=device).long()
+        noise_pred = model(img, t_tensor)
+        alpha = diffusion.alphas[t]
+        alpha_hat = diffusion.alpha_hat[t]
+        beta = diffusion.betas[t]
+
+        noise = torch.randn_like(img) if t > 0 else torch.zeros_like(img)
+        img = 1/torch.sqrt(alpha) * (img - ((1-alpha)/torch.sqrt(1-alpha_hat))*noise_pred) + torch.sqrt(beta)*noise
+
+    img = img.squeeze().cpu().numpy()
+
+    if is_phase:
+        sin_out, cos_out = img[0], img[1]
+        phase_recon = np.arctan2(sin_out, cos_out)
+        return phase_recon
+    else:
+        spec_db = (img + 1) / 2 * (max_db - min_db) + min_db
+        spec_mag = 10 ** (spec_db / 20)
+        return spec_mag
+
+
+# =====================
+# 실행 예시
+# =====================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--is_phase", type=bool, default=False)
     parser.add_argument("--data_dir", type=str, default="data/magnitude/")
-    parser.add_argument("--sample_dir", type=str, default="samples/magnitude/")
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints/magnitude/")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--timesteps", type=int, default=300)
     parser.add_argument("--base_ch", type=int, default=32)
-    parser.add_argument("--save_interval", type=int, default=10)
-    parser.add_argument("--num_samples", type=int, default=16)
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    os.makedirs(args.sample_dir, exist_ok=True)
+    os.makedirs(args.data_dir, exist_ok=True)
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
-    log_path = os.path.join(args.sample_dir, "log.txt")
-    with open(log_path, "a") as f:
-        f.write(f"\n==== New Run: {datetime.now()} ====\n")
-    log_training_params(log_path, args)
-    setup_logger(log_path)
-
     model, diffusion = train_diffusion(
-        is_phase=args.is_phase,
         data_dir=args.data_dir,
-        ckpt_dir=args.ckpt_dir,
+        is_phase=args.is_phase,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         timesteps=args.timesteps,
         base_ch=args.base_ch,
-        save_interval=args.save_interval,
-        device=device
+        device=device,
+        ckpt_dir=args.ckpt_dir
     )
+
+    # 샘플 생성
+    gen = sample(model, diffusion,
+                 shape=(1, 2, 129, 376) if args.is_phase else (1, 1, 129, 376),
+                 device=device,
+                 is_phase=args.is_phase)
+
+    plt.imshow(gen, aspect="auto", origin="lower", cmap="jet")
+    plt.colorbar(label="Phase" if args.is_phase else "Magnitude")
+    plt.title("Generated Spectrogram")
+    plt.savefig("generated_example.png", dpi=300)
