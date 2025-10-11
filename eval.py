@@ -9,6 +9,12 @@ from scipy.stats import pearsonr
 from tqdm import tqdm
 from openpyxl import Workbook
 
+def str2bool(v):
+    if isinstance(v, bool): return v
+    v = v.lower()
+    if v in ("yes","true","t","y","1"): return True
+    if v in ("no","false","f","n","0"): return False
+    raise argparse.ArgumentTypeError("Expected boolean value.")
 
 # === 기본 지표 ===
 def mse(gt, pred): return np.mean((gt - pred) ** 2)
@@ -27,11 +33,24 @@ def log_spectral_distance(gt, pred):
     pred_log = 10 * np.log10(pred + eps)
     return np.mean(np.sqrt(np.mean((gt_log - pred_log) ** 2, axis=-1)))
 
+# === ✅ circular metric 추가 ===
+def circular_mse(gt, pred):
+    """
+    위상 데이터용 circular mean squared error
+    linear difference 대신 1 - cos(Δφ)를 사용
+    """
+    diff = gt - pred
+    return np.mean(1 - np.cos(diff))
 
-# === 평가 함수 (조건부) ===
-def evaluate_class(gt_files, gen_files, max_pairs=None, class_name=""):
+
+# === 평가 함수 ===
+def evaluate_class(gt_files, gen_files, max_pairs=None, class_name="", is_phase=False):
+    if len(gt_files) == 0 or len(gen_files) == 0:
+        return None
+
     mse_list, mae_list, psnr_list, ssim_list = [], [], [], []
     cos_list, corr_list, sc_list, lsd_list = [], [], [], []
+    circ_list = []
 
     total_pairs = len(gt_files) * len(gen_files)
     if max_pairs is not None:
@@ -50,9 +69,14 @@ def evaluate_class(gt_files, gen_files, max_pairs=None, class_name=""):
             else:
                 gt_tmp, gen_tmp = gt, gen
 
-            mse_list.append(mse(gt_tmp, gen_tmp))
+            if is_phase:
+                # ✅ circular MSE
+                circ_list.append(circular_mse(gt_tmp, gen_tmp))
+            else:
+                mse_list.append(mse(gt_tmp, gen_tmp))
+                psnr_list.append(psnr(gt_tmp, gen_tmp))
+
             mae_list.append(mae(gt_tmp, gen_tmp))
-            psnr_list.append(psnr(gt_tmp, gen_tmp))
             ssim_list.append(ssim(gt_tmp, gen_tmp, data_range=gen_tmp.max() - gen_tmp.min()))
             cos_list.append(cosine_similarity(gt_tmp, gen_tmp))
             corr_list.append(correlation(gt_tmp, gen_tmp))
@@ -65,10 +89,8 @@ def evaluate_class(gt_files, gen_files, max_pairs=None, class_name=""):
         if max_pairs is not None and count >= max_pairs:
             break
 
-    return {
-        "MSE": np.mean(mse_list),
+    results = {
         "MAE": np.mean(mae_list),
-        "PSNR": np.mean(psnr_list),
         "SSIM": np.mean(ssim_list),
         "Cosine": np.mean(cos_list),
         "Correlation": np.mean(corr_list),
@@ -76,37 +98,30 @@ def evaluate_class(gt_files, gen_files, max_pairs=None, class_name=""):
         "Log-Spectral Distance": np.mean(lsd_list),
     }
 
+    if is_phase:
+        results["Circular MSE"] = np.mean(circ_list)
+    else:
+        results["MSE"] = np.mean(mse_list)
+        results["PSNR"] = np.mean(psnr_list)
 
-# === 평가 함수 (비조건부) ===
-def evaluate_uncond(gt_dir, gen_dir, max_pairs=None):
-    gt_files = sorted(glob(os.path.join(gt_dir, "*.npy")))
-    gen_files = sorted(glob(os.path.join(gen_dir, "*.npy")))
-
-    if len(gt_files) == 0 or len(gen_files) == 0:
-        raise ValueError("GT 또는 생성 샘플 폴더에 파일이 없습니다.")
-
-    return evaluate_class(gt_files, gen_files, max_pairs=max_pairs, class_name="uncond")
+    return results
 
 
-# === 결과 저장 ===
-def save_results_to_excel(results, out_path="evaluation_results.xlsx", conditional=False):
+# === Excel 저장 ===
+def save_results_to_excel(results, avg_results, out_path="evaluation_results.xlsx"):
     wb = Workbook()
     ws = wb.active
     ws.title = "Results"
 
-    if conditional:
-        header = ["Class"] + list(next(iter(results.values())).keys())
-        ws.append(header)
-        for cls, res in results.items():
-            row = [cls] + [round(v, 6) for v in res.values()]
-            ws.append(row)
-        avg_results = {metric: np.mean([res[metric] for res in results.values()])
-                       for metric in next(iter(results.values())).keys()}
-        ws.append([])
-        ws.append(["AVERAGE"] + [round(v, 6) for v in avg_results.values()])
-    else:
-        ws.append(list(results.keys()))
-        ws.append([round(v, 6) for v in results.values()])
+    header = ["Class"] + list(next(iter(results.values())).keys())
+    ws.append(header)
+
+    for cls, res in results.items():
+        row = [cls] + [round(v, 6) for v in res.values()]
+        ws.append(row)
+
+    ws.append([])
+    ws.append(["AVERAGE"] + [round(v, 6) for v in avg_results.values()])
 
     wb.save(out_path)
     print(f"✅ Results saved to {out_path}")
@@ -116,6 +131,7 @@ def save_results_to_excel(results, out_path="evaluation_results.xlsx", condition
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--conditional", action="store_true", help="조건부 평가 여부")
+    parser.add_argument("--is_phase", type=str2bool, help="phase 데이터 여부 (circular metric 사용)")
     parser.add_argument("--gt_root", type=str, required=True, help="GT 데이터 경로")
     parser.add_argument("--gen_root", type=str, required=True, help="생성 샘플 경로")
     parser.add_argument("--max_pairs", type=int, default=None, help="평가할 최대 pair 수")
@@ -123,7 +139,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.conditional:
-        # GT prefix별 그룹핑
         gt_files = glob(os.path.join(args.gt_root, "*.npy"))
         gt_by_class = {}
         for f in gt_files:
@@ -140,7 +155,8 @@ if __name__ == "__main__":
                 continue
 
             res = evaluate_class(gt_by_class[cls], gen_files,
-                                 max_pairs=args.max_pairs, class_name=cls)
+                                 max_pairs=args.max_pairs, class_name=cls,
+                                 is_phase=args.is_phase)
             if res:
                 all_results[cls] = res
                 print(f"Class {cls} results:", res)
@@ -151,12 +167,16 @@ if __name__ == "__main__":
             print("\n=== Average over all classes ===")
             for k, v in avg_results.items():
                 print(f"{k}: {v:.4f}")
-            save_results_to_excel(all_results, args.out_excel, conditional=True)
+            save_results_to_excel(all_results, avg_results, args.out_excel)
         else:
             print("⚠️ No results to evaluate.")
     else:
-        results = evaluate_uncond(args.gt_root, args.gen_root, max_pairs=args.max_pairs)
-        print("Evaluation Results (Unconditional):")
+        # 비조건부 평가
+        gt_files = sorted(glob(os.path.join(args.gt_root, "*.npy")))
+        gen_files = sorted(glob(os.path.join(args.gen_root, "*.npy")))
+        results = evaluate_class(gt_files, gen_files,
+                                 max_pairs=args.max_pairs, class_name="uncond",
+                                 is_phase=args.is_phase)
+        print("Evaluation Results:")
         for k, v in results.items():
             print(f"{k}: {v:.4f}")
-        save_results_to_excel(results, args.out_excel, conditional=False)
