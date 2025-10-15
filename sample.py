@@ -6,10 +6,11 @@ import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from main import UNet, Diffusion, str2bool
+from main import UNet, Diffusion
 
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  # Arrange GPU devices starting from 0
-os.environ["CUDA_VISIBLE_DEVICES"]= "3"  # Set the GPU 2 to use
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
 
 # ===============================
 # Model Loader
@@ -17,12 +18,13 @@ os.environ["CUDA_VISIBLE_DEVICES"]= "3"  # Set the GPU 2 to use
 def load_model(ckpt_path, device="cuda",
                base_ch=32, timesteps=300,
                conditional=False, num_classes=0,
-               is_phase=False):
+               type="magnitude"):
     """체크포인트 로드 및 모델 초기화"""
-    in_ch = 2 if is_phase else 1
-    out_ch = 2 if is_phase else 1
+    in_ch = 2 if type == "phase" else 1
+    out_ch = 2 if type == "phase" else 1
 
-    model = UNet(in_ch, out_ch, base_ch, [1, 2, 4, 8], conditional, num_classes).to(device)
+    model = UNet(in_ch, out_ch, base_ch, [1, 2, 4, 8],
+                 conditional, num_classes).to(device)
     diffusion = Diffusion(timesteps, device)
     ckpt = torch.load(ckpt_path, map_location=device)
 
@@ -38,15 +40,15 @@ def load_model(ckpt_path, device="cuda",
 # ===============================
 @torch.no_grad()
 def sample(model, diffusion, shape, device,
-           is_phase, phase_mode="residual",
+           type="magnitude", phase_mode="residual",
            n_fft=256, hop=128,
            norm_type="zscore",
            min_db=-80, max_db=0,
            db_mu=None, db_sigma=None):
     """
     Diffusion Sampling
-    - Phase: residual 복원
-    - Magnitude: inverse normalization
+    type="phase" → 위상 잔차 복원
+    type="magnitude" / "None" → 정규화 역변환
     """
     img = torch.randn(shape, device=device)
 
@@ -64,26 +66,19 @@ def sample(model, diffusion, shape, device,
     # -------------------
     # Phase Residual 복원
     # -------------------
-    if is_phase:
-        if phase_mode != "residual":
-            raise ValueError("Checkpoint is not residual-phase mode.")
-
+    if type == "phase":
         sin_out, cos_out = img[0], img[1]
         sin_out = np.clip(sin_out, -1.0, 1.0)
         cos_out = np.clip(cos_out, -1.0, 1.0)
-
-        # 단위 원 정규화
         norm = np.sqrt(sin_out**2 + cos_out**2 + 1e-8)
         sin_out /= norm
         cos_out /= norm
 
-        # Residual → Absolute Phase 복원
         resid = np.arctan2(sin_out, cos_out)
         F = resid.shape[0]
         k = np.arange(F)
         expected_adv = 2 * np.pi * hop * k / float(n_fft)
         inc = resid + expected_adv[:, None]
-
         phi = np.cumsum(inc, axis=1)
         phi0 = np.zeros((F, 1), dtype=np.float32)
         phase = np.concatenate([phi0, phi], axis=1)
@@ -91,19 +86,24 @@ def sample(model, diffusion, shape, device,
         return phase
 
     # -------------------
-    # Magnitude 복원
+    # Magnitude / None 복원
     # -------------------
-    else:
+    elif type in ["magnitude", "None", "none"]:
         if norm_type == "zscore":
             assert db_mu is not None and db_sigma is not None, "zscore reverse requires db_mu/db_sigma"
             spec_db = img * db_sigma + db_mu
         elif norm_type == "0to1":
             spec_db = img * (max_db - min_db) + min_db
-        else:
+        elif norm_type == "-1to1":
             spec_db = (img + 1.0) / 2.0 * (max_db - min_db) + min_db
+        else:
+            raise ValueError(f"Unsupported norm_type: {norm_type}")
 
         spec_mag = 10 ** (spec_db / 20.0)
         return spec_mag
+
+    else:
+        raise ValueError(f"Unsupported type: {type}")
 
 
 # ===============================
@@ -122,37 +122,41 @@ def main(args):
             cond_map = json.load(f)
         num_classes = len(cond_map)
 
-    # 체크포인트 및 메타 정보 로드
+    # 체크포인트 로드
     ckpt = torch.load(args.ckpt, map_location="cpu")
-    is_phase_ckpt = ckpt.get("is_phase", args.is_phase)
+    type_ckpt = ckpt.get("type", args.type)
     phase_mode = ckpt.get("phase_mode", "residual")
     n_fft = int(ckpt.get("n_fft", 256))
     hop = int(ckpt.get("hop_length", 128))
 
     model, diffusion, _ = load_model(
         args.ckpt, device, args.base_ch, args.timesteps,
-        args.conditional, num_classes, is_phase=is_phase_ckpt
+        args.conditional, num_classes, type=type_ckpt
     )
 
     # 정규화 정보
-    norm_type = ckpt.get("norm_type", "zscore")
+    norm_type = args.norm_type or ckpt.get("norm_type", "zscore")
     min_db = ckpt.get("min_db", -80.0)
     max_db = ckpt.get("max_db", 0.0)
     db_mu = ckpt.get("db_mu", None)
     db_sigma = ckpt.get("db_sigma", None)
 
-    print(f"✅ Sampling config: norm={norm_type}, phase_mode={phase_mode}")
+    print(f"✅ Sampling config: type={type_ckpt}, norm={norm_type}, shape={args.shape}")
 
     # -----------------------
-    # 여러 개 샘플 생성
+    # 샘플 생성
     # -----------------------
-    shape = (1, 2, 129, 375) if is_phase_ckpt else (1, 1, 129, 376)
+    H, W = args.shape
+    if type_ckpt == "phase":
+        shape = (1, 2, H, W - 1)
+    else:
+        shape = (1, 1, H, W)
 
     for i in range(args.num_samples):
         print(f"🎨 Generating sample {i+1}/{args.num_samples} ...")
         sample_data = sample(
             model, diffusion, shape, device,
-            is_phase=is_phase_ckpt, phase_mode=phase_mode,
+            type=type_ckpt, phase_mode=phase_mode,
             n_fft=n_fft, hop=hop,
             norm_type=norm_type, min_db=min_db, max_db=max_db,
             db_mu=db_mu, db_sigma=db_sigma
@@ -168,10 +172,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, required=True, help="Checkpoint path")
     parser.add_argument("--out_dir", type=str, default="samples", help="Output directory")
-    parser.add_argument("--is_phase", type=str2bool, default=True)
+    parser.add_argument("--type", type=str, default="magnitude",
+                        choices=["phase", "magnitude", "None"],
+                        help="Data type: phase / magnitude / None")
     parser.add_argument("--conditional", action="store_true")
     parser.add_argument("--base_ch", type=int, default=32)
     parser.add_argument("--timesteps", type=int, default=300)
-    parser.add_argument("--num_samples", type=int, default=16, help="Number of samples to generate")  # ✅ 추가
+    parser.add_argument("--num_samples", type=int, default=16)
+    parser.add_argument("--norm_type", type=str, default="zscore",
+                        choices=["zscore", "0to1", "-1to1"],
+                        help="Normalization type")
+    parser.add_argument("--shape", type=int, nargs=2, default=[129, 376],
+                        help="Output shape as H W (e.g., --shape 129 376)")
     args = parser.parse_args()
     main(args)
