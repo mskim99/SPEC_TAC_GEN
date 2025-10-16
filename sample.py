@@ -99,8 +99,13 @@ def sample(model, diffusion, shape, device,
         else:
             raise ValueError(f"Unsupported norm_type: {norm_type}")
 
-        spec_mag = 10 ** (spec_db / 20.0)
-        return spec_mag
+        # ✅ magnitude일 때만 dB → amplitude 변환 수행
+        if type == "magnitude":
+            spec_mag = 10 ** (spec_db / 20.0)
+            return spec_mag
+        else:
+            # ✅ None인 경우엔 정규화된 값만 반환
+            return spec_db
 
     else:
         raise ValueError(f"Unsupported type: {type}")

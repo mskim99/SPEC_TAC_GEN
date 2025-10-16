@@ -6,12 +6,12 @@ from tqdm import tqdm
 
 # ---------- Settings ----------
 input_dir  = "/data/jionkim/LMT_108_surface"            # 입력 시계열 폴더
-output_dir = "/data/jionkim/LMT_108_surface_wavelet"         # 결과 저장 폴더
-orig_len   = 40960                              # 원 신호 길이
-H0, W0     = 1024, 4096                         # 원 CWT 해상도 (scale x time)
+output_dir = "/data/jionkim/LMT_108_surface_wavelet"    # 결과 저장 폴더
+orig_len   = 40960                                      # 원 신호 길이
+H0, W0     = 1024, 4096                                 # 원 CWT 해상도 (scale x time)
 wavelet    = "cmor1.5-1.0"
-targets    = [(1024, 1024)]                      # 생성할 중간 해상도 목록
-use_log_scale = True                            # 로그 스케일 리샘플 적용 여부
+targets    = [(1024, 1024)]                             # 생성할 중간 해상도 목록
+use_log_scale = True                                    # 로그 스케일 리샘플 적용 여부
 
 # ---------- Utilities ----------
 def cwt_1024_4096(x):
@@ -60,17 +60,39 @@ print(f"총 {len(files)}개의 시계열 처리 중...")
 for fname in tqdm(files):
     fpath = os.path.join(input_dir, fname)
     base = os.path.splitext(fname)[0]
+    skip_flag = True
+
+    # 변환 완료 여부 체크
+    for (Ht, Wt) in targets:
+        real_out = os.path.join(dirs["real_mid"], f"{base}_real_{Ht}x{Wt}.npy")
+        imag_out = os.path.join(dirs["imag_mid"], f"{base}_imag_{Ht}x{Wt}.npy")
+        if not (os.path.exists(real_out) and os.path.exists(imag_out)):
+            skip_flag = False
+            break
+
+    # 이미 완료된 경우 스킵
+    if skip_flag:
+        continue
+
+    # 1️⃣ 데이터 로드
     x = np.load(fpath).astype(np.float32)[:orig_len]
 
-    # 1️⃣ CWT 계산
+    # 2️⃣ CWT 계산
     coef = cwt_1024_4096(x)
 
-    # 2️⃣ Real / Imag 분리 + 정규화
+    # 3️⃣ Real / Imag 분리 + 정규화
     real = normalize_pm1(np.real(coef))
     imag = normalize_pm1(np.imag(coef))
 
-    # 3️⃣ 중간 해상도 생성 및 저장
+    # 4️⃣ 중간 해상도 생성 및 저장
     for (Ht, Wt) in targets:
+        real_out = os.path.join(dirs["real_mid"], f"{base}_real_{Ht}x{Wt}.npy")
+        imag_out = os.path.join(dirs["imag_mid"], f"{base}_imag_{Ht}x{Wt}.npy")
+
+        # 중간 결과 파일이 이미 있으면 skip
+        if os.path.exists(real_out) and os.path.exists(imag_out):
+            continue
+
         if use_log_scale:
             real_mid = resize_poly_2d(resize_scale_log(real, Ht), Ht, Wt)
             imag_mid = resize_poly_2d(resize_scale_log(imag, Ht), Ht, Wt)
@@ -78,8 +100,8 @@ for fname in tqdm(files):
             real_mid = resize_poly_2d(real, Ht, Wt)
             imag_mid = resize_poly_2d(imag, Ht, Wt)
 
-        np.save(os.path.join(dirs["real_mid"], f"{base}_real_{Ht}x{Wt}.npy"), real_mid)
-        np.save(os.path.join(dirs["imag_mid"], f"{base}_imag_{Ht}x{Wt}.npy"), imag_mid)
+        np.save(real_out, real_mid)
+        np.save(imag_out, imag_mid)
 
-print("✅ 모든 중간 해상도 real/imag 이미지 생성 및 저장 완료!")
+print("✅ 모든 변환 완료 (이미 변환된 파일은 스킵됨)")
 print(f"출력 경로: {output_dir}")
