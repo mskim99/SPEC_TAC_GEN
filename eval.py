@@ -173,7 +173,7 @@ if __name__ == "__main__":
     else:
         # 비조건부 평가
         gt_files = sorted(glob(os.path.join(args.gt_root, "*.npy")))
-        gen_files = sorted(glob(os.path.join(args.gen_root, "*.npy")))
+        gen_files = sorted(glob(os.path.join(args.gen_root, "*_imag.npy")))
         results = evaluate_class(gt_files, gen_files,
                                  max_pairs=args.max_pairs, class_name="uncond",
                                  is_phase=args.is_phase)

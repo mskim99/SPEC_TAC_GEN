@@ -213,6 +213,7 @@ def train_diffusion(type, conditional, data_dir,
             t = torch.randint(0, diffusion.timesteps, (x.shape[0],), device=device).long()
             noisy, noise = diffusion.add_noise(x, t)
             pred = model(noisy, t, cond) if conditional else model(noisy, t)
+
             loss = mse(pred, noise)
 
             optimizer.zero_grad()

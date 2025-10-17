@@ -93,9 +93,9 @@ def sample(model, diffusion, shape, device,
             assert db_mu is not None and db_sigma is not None, "zscore reverse requires db_mu/db_sigma"
             spec_db = img * db_sigma + db_mu
         elif norm_type == "0to1":
-            spec_db = img * (max_db - min_db) + min_db
+            spec_db = np.clip(img, 0.0, 1.0)
         elif norm_type == "-1to1":
-            spec_db = (img + 1.0) / 2.0 * (max_db - min_db) + min_db
+            spec_db = np.clip(img, -1.0, 1.0)
         else:
             raise ValueError(f"Unsupported norm_type: {norm_type}")
 
@@ -104,7 +104,7 @@ def sample(model, diffusion, shape, device,
             spec_mag = 10 ** (spec_db / 20.0)
             return spec_mag
         else:
-            # ✅ None인 경우엔 정규화된 값만 반환
+            # ✅ None일 때는 단순 정규화된 값 그대로 반환
             return spec_db
 
     else:
@@ -177,7 +177,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, required=True, help="Checkpoint path")
     parser.add_argument("--out_dir", type=str, default="samples", help="Output directory")
-    parser.add_argument("--type", type=str, default="magnitude",
+    parser.add_argument("--type", type=str, default="None",
                         choices=["phase", "magnitude", "None"],
                         help="Data type: phase / magnitude / None")
     parser.add_argument("--conditional", action="store_true")
