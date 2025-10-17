@@ -5,8 +5,8 @@ from scipy.signal import resample, resample_poly
 from tqdm import tqdm
 
 # ---------- Settings ----------
-input_dir  = "/data/jionkim/LMT_108_surface"            # 입력 시계열 폴더
-output_dir = "/data/jionkim/LMT_108_surface_wavelet"    # 결과 저장 폴더
+input_dir  = "/home/jionkim/STFT_gen/data/GT_THD"            # 입력 시계열 폴더
+output_dir = "/home/jionkim/STFT_gen/data/GT_THD_wavelet"    # 결과 저장 폴더
 orig_len   = 40960                                      # 원 신호 길이
 H0, W0     = 1024, 4096                                 # 원 CWT 해상도 (scale x time)
 wavelet    = "cmor1.5-1.0"

@@ -1,6 +1,5 @@
 import os
 import glob
-import json
 import argparse
 import numpy as np
 import torch
@@ -20,6 +19,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 class ComplexWaveletDataset(Dataset):
     """
     Real + Imag 2채널 Wavelet coefficient 학습용
+    (입력 clamp + tanh 정규화)
     """
     def __init__(self, real_dir, imag_dir, norm_type="tanh"):
         self.real_files = sorted(glob.glob(os.path.join(real_dir, "*.npy")))
@@ -31,6 +31,7 @@ class ComplexWaveletDataset(Dataset):
         return len(self.real_files)
 
     def _normalize(self, arr):
+        arr = np.clip(arr, -1.0, 1.0)  # ✅ Clamp to [-1,1]
         if self.norm_type == "zscore":
             return (arr - np.mean(arr)) / (np.std(arr) + 1e-12)
         elif self.norm_type == "tanh":
@@ -51,50 +52,22 @@ class ComplexWaveletDataset(Dataset):
 
 
 # ===============================
-# Frequency-aware Loss
+# Cosine Beta Schedule (Improved)
 # ===============================
-class FrequencyAwareLoss(nn.Module):
-    def __init__(self, weight_low=1.0, weight_high=2.0):
-        super().__init__()
-        self.weight_low = weight_low
-        self.weight_high = weight_high
-
-    def forward(self, pred, target):
-        # 주파수 축: scale (height)
-        B, C, H, W = pred.shape
-        freqs = torch.linspace(0, 1, H, device=pred.device).view(1, 1, H, 1)
-        freq_weight = self.weight_low + (self.weight_high - self.weight_low) * freqs
-        return torch.mean(freq_weight * (pred - target) ** 2)
-
-
-# ===============================
-# Phase Consistency Loss
-# ===============================
-def phase_consistency_loss(pred, target):
-    """
-    Real–Imag 위상 일관성 유지용
-    """
-    pred_real, pred_imag = pred[:, 0], pred[:, 1]
-    gt_real, gt_imag = target[:, 0], target[:, 1]
-    dot = pred_real * gt_real + pred_imag * gt_imag
-    norm_p = torch.sqrt(pred_real**2 + pred_imag**2 + 1e-12)
-    norm_t = torch.sqrt(gt_real**2 + gt_imag**2 + 1e-12)
-    cos_sim = dot / (norm_p * norm_t)
-    return 1 - torch.mean(cos_sim)
-
-
-# ===============================
-# Diffusion
-# ===============================
-def linear_beta_schedule(timesteps, start=1e-4, end=0.02):
-    return torch.linspace(start, end, timesteps)
+def cosine_beta_schedule(timesteps, s=0.008):
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * np.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 1e-5, 0.999)
 
 
 class Diffusion:
-    def __init__(self, timesteps=300, device="cuda"):
+    def __init__(self, timesteps=500, device="cuda"):
         self.device = device
         self.timesteps = timesteps
-        self.betas = linear_beta_schedule(timesteps).to(device)
+        self.betas = cosine_beta_schedule(timesteps).to(device)
         self.alphas = 1. - self.betas
         self.alpha_hat = torch.cumprod(self.alphas, dim=0)
 
@@ -105,36 +78,72 @@ class Diffusion:
         return sa * x0 + so * noise, noise
 
 
-def train_diffusion_complex(real_dir, imag_dir, epochs=50, batch_size=4, lr=1e-4,
-                            timesteps=300, base_ch=32, ckpt_dir="checkpoints_complex",
-                            device="cuda", save_interval=10, norm_type="tanh",
-                            lambda_freq=0.5, lambda_phase=0.3,
+# ===============================
+# Frequency-aware Loss (강화)
+# ===============================
+class FrequencyAwareLoss(nn.Module):
+    def __init__(self, weight_low=1.0, weight_high=3.0):
+        super().__init__()
+        self.weight_low = weight_low
+        self.weight_high = weight_high
+
+    def forward(self, pred, target):
+        B, C, H, W = pred.shape
+        freqs = torch.linspace(0, 1, H, device=pred.device).view(1, 1, H, 1)
+        freq_weight = self.weight_low + (self.weight_high - self.weight_low) * freqs
+        return torch.mean(freq_weight * (pred - target) ** 2)
+
+
+# ===============================
+# Phase Consistency Loss (개선)
+# ===============================
+def phase_consistency_loss(pred, target):
+    pred_real, pred_imag = pred[:, 0], pred[:, 1]
+    gt_real, gt_imag = target[:, 0], target[:, 1]
+
+    # 벡터 내적 기반 cosine similarity
+    dot = (pred_real * gt_real + pred_imag * gt_imag)
+    norm_pred = torch.sqrt(pred_real**2 + pred_imag**2 + 1e-12)
+    norm_gt = torch.sqrt(gt_real**2 + gt_imag**2 + 1e-12)
+    cos_sim = dot / (norm_pred * norm_gt + 1e-12)
+
+    return 1 - torch.mean(cos_sim)  # ✅ 1 - mean(cosine similarity)
+
+
+# ===============================
+# Train Function
+# ===============================
+def train_diffusion_complex(real_dir, imag_dir, epochs=200, batch_size=8, lr=1e-4,
+                            timesteps=500, base_ch=64, ckpt_dir="checkpoints_complex_v2",
+                            device="cuda", save_interval=20, norm_type="tanh",
+                            lambda_freq=1.0, lambda_phase=1.0,
                             resume_ckpt=None):
-    """
-    resume_ckpt: checkpoint 파일 경로 (있을 경우 이어서 학습)
-    """
     os.makedirs(ckpt_dir, exist_ok=True)
     dataset = ComplexWaveletDataset(real_dir, imag_dir, norm_type)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
     in_ch = out_ch = 2
     model = UNet(in_ch, out_ch, base_ch, [1, 2, 4, 8]).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
     mse = nn.MSELoss()
     freq_loss_fn = FrequencyAwareLoss()
     diffusion = Diffusion(timesteps, device)
 
     start_epoch = 0
 
-    # ✅ Checkpoint resume 기능
+    # ✅ Resume 기능
     if resume_ckpt is not None and os.path.exists(resume_ckpt):
         ckpt = torch.load(resume_ckpt, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
         start_epoch = ckpt.get("epoch", 0)
-        print(f"✅ Checkpoint loaded from {resume_ckpt} (start from epoch {start_epoch})")
+        print(f"✅ Checkpoint loaded from {resume_ckpt} (epoch {start_epoch})")
 
     for epoch in range(start_epoch, epochs):
         total_loss = 0.0
+        model.train()
+
         for batch in dataloader:
             x = batch.to(device)
             t = torch.randint(0, diffusion.timesteps, (x.shape[0],), device=device).long()
@@ -149,61 +158,55 @@ def train_diffusion_complex(real_dir, imag_dir, epochs=50, batch_size=4, lr=1e-4
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # ✅ Gradient clipping
             optimizer.step()
+
             total_loss += loss.item()
 
-        print(f"[{epoch+1}/{epochs}] Total Loss: {total_loss/len(dataloader):.6f}")
+        scheduler.step()
+        avg_loss = total_loss / len(dataloader)
+        print(f"[{epoch+1}/{epochs}] Loss={avg_loss:.6f} | LR={scheduler.get_last_lr()[0]:.6e}")
 
+        # ✅ Save checkpoint
         if (epoch + 1) % save_interval == 0 or (epoch + 1) == epochs:
+            ckpt_path = os.path.join(ckpt_dir, f"ckpt_epoch_{epoch+1:04d}.pt")
             torch.save({
                 "epoch": epoch + 1,
                 "model_state_dict": model.state_dict(),
-                "loss": total_loss/len(dataloader),
+                "loss": avg_loss,
                 "lambda_freq": lambda_freq,
                 "lambda_phase": lambda_phase,
                 "norm_type": norm_type,
-                "type": "complex_wavelet"
-            }, os.path.join(ckpt_dir, f"ckpt_epoch_{epoch+1:04d}.pt"))
+                "type": "complex_wavelet_v2"
+            }, ckpt_path)
+            print(f"✅ Saved checkpoint: {ckpt_path}")
 
+    print("🎯 Training Complete!")
     return model, diffusion
 
 
 # ===============================
-# Main (with checkpoint index)
+# Main Entry
 # ===============================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--real_dir", type=str, required=True, help="Real coefficient npy 폴더")
-    parser.add_argument("--imag_dir", type=str, required=True, help="Imag coefficient npy 폴더")
-    parser.add_argument("--ckpt_dir", type=str, required=True, help="Checkpoint 폴더")
-    parser.add_argument("--ckpt_index", type=int, default=None, help="불러올 checkpoint index (예: 100 → ckpt_epoch_0100.pt)")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--real_dir", type=str, required=True)
+    parser.add_argument("--imag_dir", type=str, required=True)
+    parser.add_argument("--ckpt_dir", type=str, default="checkpoints_complex_v2")
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--timesteps", type=int, default=300)
-    parser.add_argument("--base_ch", type=int, default=32)
-    parser.add_argument("--save_interval", type=int, default=10)
+    parser.add_argument("--timesteps", type=int, default=500)
+    parser.add_argument("--base_ch", type=int, default=64)
+    parser.add_argument("--save_interval", type=int, default=20)
     parser.add_argument("--norm_type", type=str, default="tanh", choices=["tanh", "zscore", "0to1"])
-    parser.add_argument("--lambda_freq", type=float, default=0.5)
-    parser.add_argument("--lambda_phase", type=float, default=0.3)
+    parser.add_argument("--lambda_freq", type=float, default=1.0)
+    parser.add_argument("--lambda_phase", type=float, default=1.0)
+    parser.add_argument("--resume_ckpt", type=str, default=None)
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # ✅ checkpoint index 기반 로드 기능 추가
-    ckpt_path = None
-    if args.ckpt_index is not None:
-        ckpt_path = os.path.join(args.ckpt_dir, f"ckpt_epoch_{args.ckpt_index:04d}.pt")
-        if not os.path.exists(ckpt_path):
-            raise FileNotFoundError(f"❌ 지정된 checkpoint 파일이 존재하지 않습니다: {ckpt_path}")
-        print(f"✅ Checkpoint {ckpt_path} 로드 중...")
-
-        # checkpoint 로드 후 이어서 학습 (선택적으로)
-        ckpt = torch.load(ckpt_path, map_location=device)
-        print(f"✅ 로드 완료 (epoch={ckpt.get('epoch', 'unknown')}, loss={ckpt.get('loss', 0):.6f})")
-
-    # 학습 실행 (checkpoint가 있으면 이어서 학습 가능)
-    model, diffusion = train_diffusion_complex(
+    train_diffusion_complex(
         real_dir=args.real_dir,
         imag_dir=args.imag_dir,
         epochs=args.epochs,
@@ -217,5 +220,5 @@ if __name__ == "__main__":
         norm_type=args.norm_type,
         lambda_freq=args.lambda_freq,
         lambda_phase=args.lambda_phase,
-        resume_ckpt=ckpt_path
+        resume_ckpt=args.resume_ckpt
     )

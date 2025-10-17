@@ -5,7 +5,7 @@ from scipy.signal import resample_poly
 from tqdm import tqdm
 
 import matplotlib
-matplotlib.use("Agg")  # GUI 없이 이미지 저장 가능하도록 설정
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
@@ -20,15 +20,12 @@ def resize_poly_2d(M, Ht, Wt):
 
 
 def reconstruct_signal_from_coef(real_data, imag_data):
-    """
-    wavelet 계수(real, imag)로부터 시계열 복원 (수치 근사)
-    """
+    """wavelet 계수(real, imag)로부터 시계열 복원 (수치 근사)"""
     coef_rec = real_data + 1j * imag_data
     n_scales, _ = coef_rec.shape
     scales = np.arange(1, n_scales + 1)
     da = np.gradient(scales)
     rec_raw = np.sum(np.real(coef_rec) * (da[:, None] / (scales[:, None] ** 1.5)), axis=0)
-    # 정규화 (optional)
     rec_raw -= np.mean(rec_raw)
     rec_raw /= np.max(np.abs(rec_raw)) + 1e-12
     return rec_raw
@@ -38,35 +35,22 @@ def reconstruct_signal_from_coef(real_data, imag_data):
 # Main
 # ======================
 def main(args):
-    real_dir = args.real_dir
-    imag_dir = args.imag_dir
+    input_dir = args.input_dir
     out_dir = args.output_dir
-    # out_dir = os.path.join(args.output_dir, "reconstructed")
     os.makedirs(out_dir, exist_ok=True)
 
-    files = sorted([f for f in os.listdir(real_dir) if f.endswith(".npy")])
-    print(f"총 {len(files)}개 파일 복원 중...")
+    # 🔹 동일 폴더 내에서 _real.npy 쌍 자동 탐색
+    real_files = sorted([f for f in os.listdir(input_dir) if f.endswith("_real.npy")])
+    print(f"총 {len(real_files)}개 파일 쌍 복원 중...")
     H0, W0 = 1024, 4096
 
-    for fname in tqdm(files):
-        base = fname.replace("_real.npy", "").replace("_real_mid.npy", "").replace(".npy", "")
-        real_path = os.path.join(real_dir, fname)
+    for fname in tqdm(real_files):
+        base = fname.replace("_real.npy", "")
+        real_path = os.path.join(input_dir, fname)
+        imag_path = os.path.join(input_dir, f"{base}_imag.npy")
 
-        # 가능한 imag 파일명 탐색
-        imag_candidates = [
-            f"{base}_imag.npy",
-            f"{base}_imag_mid.npy",
-            f"{base}.npy"
-        ]
-        imag_path = None
-        for cand in imag_candidates:
-            cand_path = os.path.join(imag_dir, cand)
-            if os.path.exists(cand_path):
-                imag_path = cand_path
-                break
-
-        if imag_path is None:
-            print(f"⚠️ {base}의 imag 파일을 찾을 수 없어 스킵합니다.")
+        if not os.path.exists(imag_path):
+            print(f"⚠️ {base}의 imag 파일이 존재하지 않아 스킵합니다.")
             continue
 
         # 1️⃣ 중간 해상도 불러오기
@@ -100,7 +84,7 @@ def main(args):
         plt.savefig(out_png, dpi=200)
         plt.close()
 
-    print(f"✅ 모든 시계열 복원 완료 ({len(files)}개)")
+    print(f"✅ 모든 시계열 복원 완료 ({len(real_files)}개)")
     print(f"출력 경로: {out_dir}")
 
 
@@ -108,11 +92,9 @@ def main(args):
 # CLI Entry
 # ======================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Wavelet Inverse Reconstruction with separate real/imag folders (save plots)")
-    parser.add_argument("--real_dir", type=str, required=True,
-                        help="real 계수 폴더 경로 (예: data/real_mid)")
-    parser.add_argument("--imag_dir", type=str, required=True,
-                        help="imag 계수 폴더 경로 (예: data/imag_mid)")
+    parser = argparse.ArgumentParser(description="Wavelet Inverse Reconstruction from single folder (real/imag pairs)")
+    parser.add_argument("--input_dir", type=str, required=True,
+                        help="real/imag 쌍이 포함된 입력 폴더 (예: data/wavelet_output)")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="복원된 신호 저장 폴더")
     parser.add_argument("--target_length", type=int, default=40960,
