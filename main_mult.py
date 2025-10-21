@@ -1,224 +1,283 @@
-import os
-import glob
-import argparse
+import os, glob, argparse
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, DataLoader
+import pywt
 from model import UNet
-import matplotlib
-matplotlib.use("Agg")
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
-# ===============================
-# Dataset
-# ===============================
-class ComplexWaveletDataset(Dataset):
-    """
-    Real + Imag 2채널 Wavelet coefficient 학습용
-    (입력 clamp + tanh 정규화)
-    """
-    def __init__(self, real_dir, imag_dir, norm_type="tanh"):
-        self.real_files = sorted(glob.glob(os.path.join(real_dir, "*.npy")))
-        self.imag_files = sorted(glob.glob(os.path.join(imag_dir, "*.npy")))
-        self.norm_type = norm_type
-        assert len(self.real_files) == len(self.imag_files), "real/imag 파일 개수가 일치해야 함"
+# -----------------------------
+# Global normalization utils
+# -----------------------------
+def norm_z_global(x, mu, std):
+    mu  = torch.as_tensor(mu,  dtype=x.dtype, device=x.device).view(1,2,1,1)
+    std = torch.as_tensor(std, dtype=x.dtype, device=x.device).view(1,2,1,1)
+    return (x - mu) / (std + 1e-8)
 
-    def __len__(self):
-        return len(self.real_files)
+def denorm_z_global(x, mu, std):
+    mu  = torch.as_tensor(mu,  dtype=x.dtype, device=x.device).view(1,2,1,1)
+    std = torch.as_tensor(std, dtype=x.dtype, device=x.device).view(1,2,1,1)
+    return x * std + mu
 
-    def _normalize(self, arr):
-        arr = np.clip(arr, -1.0, 1.0)  # ✅ Clamp to [-1,1]
-        if self.norm_type == "zscore":
-            return (arr - np.mean(arr)) / (np.std(arr) + 1e-12)
-        elif self.norm_type == "tanh":
-            return np.tanh(arr)
-        elif self.norm_type == "0to1":
-            arr_min, arr_max = arr.min(), arr.max()
-            return (arr - arr_min) / (arr_max - arr_min + 1e-12)
-        else:
-            return arr
+# -----------------------------
+# NEW: Affine-invariant loss
+# -----------------------------
+def scale_invariant_mse(pred, gt, eps=1e-8):
+    """Affine-invariant (scale-invariant) MSE"""
+    B = pred.shape[0]
+    total = 0.0
+    for b in range(B):
+        p = pred[b].flatten()
+        g = gt[b].flatten()
+        alpha = (p @ g) / (p @ p + eps)
+        total += torch.mean((alpha * p - g) ** 2)
+    return total / B
 
-    def __getitem__(self, idx):
-        real = np.load(self.real_files[idx]).astype(np.float32)
-        imag = np.load(self.imag_files[idx]).astype(np.float32)
-        real = self._normalize(real)
-        imag = self._normalize(imag)
-        spec = np.stack([real, imag], axis=0)  # (2, H, W)
-        return torch.tensor(spec, dtype=torch.float32)
+# -----------------------------
+# TV loss
+# -----------------------------
+def tv_loss(x):  # x:(B,2,H,W)
+    return (x[:,:,:,1:] - x[:,:,:,:-1]).abs().mean() + (x[:,:,1:,:] - x[:,:,:-1,:]).abs().mean()
 
-
-# ===============================
-# Cosine Beta Schedule (Improved)
-# ===============================
-def cosine_beta_schedule(timesteps, s=0.008):
-    steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps)
-    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * np.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return torch.clip(betas, 1e-5, 0.999)
-
-
+# -----------------------------
+# Diffusion
+# -----------------------------
 class Diffusion:
-    def __init__(self, timesteps=500, device="cuda"):
-        self.device = device
+    def __init__(self, timesteps=1000, device="cuda"):
+        self.device = torch.device(device)
         self.timesteps = timesteps
-        self.betas = cosine_beta_schedule(timesteps).to(device)
-        self.alphas = 1. - self.betas
+        self.betas = self._cosine_beta_schedule(timesteps).to(self.device)
+        self.alphas = (1.0 - self.betas)
         self.alpha_hat = torch.cumprod(self.alphas, dim=0)
 
+    def _cosine_beta_schedule(self, T, s=0.008, beta_min=1e-4, beta_max=0.02):
+        steps = T + 1
+        x = torch.linspace(0, T, steps, device=self.device)
+        ac = torch.cos(((x / T) + s) / (1 + s) * np.pi * 0.5) ** 2
+        ac = ac / ac[0]
+        betas = 1 - (ac[1:] / ac[:-1])
+        return torch.clamp(betas, beta_min, beta_max)
+
     def add_noise(self, x0, t):
-        sa = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
-        so = torch.sqrt(1 - self.alpha_hat[t])[:, None, None, None]
-        noise = torch.randn_like(x0)
-        return sa * x0 + so * noise, noise
+        a_hat = self.alpha_hat[t].view(-1,1,1,1)
+        mean = torch.sqrt(a_hat) * x0
+        std  = torch.sqrt(1.0 - a_hat)
+        eps = torch.randn_like(x0)
+        return mean + std * eps, eps
 
+# -----------------------------
+# Dataset
+# -----------------------------
+class WaveletComplexDataset(Dataset):
+    def __init__(self, real_dir, imag_dir, norm="per_scale_z"):
+        self.real_files = sorted(glob.glob(os.path.join(real_dir, "*.npy")))
+        self.imag_files = sorted(glob.glob(os.path.join(imag_dir, "*.npy")))
+        assert len(self.real_files) == len(self.imag_files)
+        self.norm = norm
 
-# ===============================
-# Frequency-aware Loss (강화)
-# ===============================
-class FrequencyAwareLoss(nn.Module):
-    def __init__(self, weight_low=1.0, weight_high=3.0):
+    def __len__(self): return len(self.real_files)
+
+    def _per_scale_z(self, x):
+        mu  = x.mean(axis=1, keepdims=True)
+        std = x.std(axis=1, keepdims=True) + 1e-8
+        return (x - mu) / std
+
+    def _normalize_pair(self, real, imag):
+        if self.norm == "per_scale_z":
+            real = self._per_scale_z(real)
+            imag = self._per_scale_z(imag)
+        elif self.norm == "none":
+            pass
+        else:
+            m = real.mean(); s = real.std() + 1e-8
+            real = (real - m) / s
+            m = imag.mean(); s = imag.std() + 1e-8
+            imag = (imag - m) / s
+        return real, imag
+
+    def __getitem__(self, idx):
+        r = np.load(self.real_files[idx]).astype(np.float32)
+        g = np.load(self.imag_files[idx]).astype(np.float32)
+        if r.ndim == 3: r = r[0]
+        if g.ndim == 3: g = g[0]
+        r, g = self._normalize_pair(r, g)
+        x = np.stack([r, g], axis=0)
+        return torch.from_numpy(x)
+
+# -----------------------------
+# Losses
+# -----------------------------
+def circular_mse_phase(pred_complex, gt_complex, eps=1e-8):
+    pr = pred_complex[:,0]; pi = pred_complex[:,1]
+    gr = gt_complex[:,0]; gi = gt_complex[:,1]
+    pred_ang = torch.atan2(pi, pr + eps)
+    gt_ang   = torch.atan2(gi, gr + eps)
+    d = torch.atan2(torch.sin(pred_ang-gt_ang), torch.cos(pred_ang-gt_ang))
+    return (d**2).mean()
+
+class WaveletPerceptualLoss(nn.Module):
+    def __init__(self, scales=(1,2,4), kernel_size=3):
         super().__init__()
-        self.weight_low = weight_low
-        self.weight_high = weight_high
+        self.scales = scales
+        self.pool = nn.AvgPool2d(kernel_size, stride=1, padding=kernel_size//2)
+    def forward(self, pred, gt):
+        loss = 0.0
+        p, g = pred, gt
+        for s in self.scales:
+            if s > 1:
+                p = self.pool(p)
+                g = self.pool(g)
+            pmag = torch.sqrt(p[:,0]**2 + p[:,1]**2 + 1e-8)
+            gmag = torch.sqrt(g[:,0]**2 + g[:,1]**2 + 1e-8)
+            loss = loss + torch.mean(torch.abs(pmag - gmag))
+        return loss / len(self.scales)
 
+class LogFreqAwareMSE(nn.Module):
     def forward(self, pred, target):
-        B, C, H, W = pred.shape
-        freqs = torch.linspace(0, 1, H, device=pred.device).view(1, 1, H, 1)
-        freq_weight = self.weight_low + (self.weight_high - self.weight_low) * freqs
-        return torch.mean(freq_weight * (pred - target) ** 2)
+        B,C,H,W = pred.shape
+        f = torch.arange(1, H+1, device=pred.device).float()
+        w = torch.log(1.0 + f) / torch.log(torch.tensor(1.0 + H, device=pred.device))
+        w = w.view(1,1,H,1)
+        return torch.mean(w * (pred - target)**2)
 
+# -----------------------------
+# DDPM helpers
+# -----------------------------
+def predict_x0_from_noise(x_t, noise, a_hat_t):
+    return (x_t - torch.sqrt(1.0 - a_hat_t) * noise) / (torch.sqrt(a_hat_t) + 1e-8)
 
-# ===============================
-# Phase Consistency Loss (개선)
-# ===============================
-def phase_consistency_loss(pred, target):
-    pred_real, pred_imag = pred[:, 0], pred[:, 1]
-    gt_real, gt_imag = target[:, 0], target[:, 1]
+# -----------------------------
+# Train
+# -----------------------------
+def train(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.ckpt_dir, exist_ok=True)
 
-    # 벡터 내적 기반 cosine similarity
-    dot = (pred_real * gt_real + pred_imag * gt_imag)
-    norm_pred = torch.sqrt(pred_real**2 + pred_imag**2 + 1e-12)
-    norm_gt = torch.sqrt(gt_real**2 + gt_imag**2 + 1e-12)
-    cos_sim = dot / (norm_pred * norm_gt + 1e-12)
+    writer = SummaryWriter(log_dir=os.path.join(args.ckpt_dir, "tb"))
 
-    return 1 - torch.mean(cos_sim)  # ✅ 1 - mean(cosine similarity)
+    ds = WaveletComplexDataset(args.real_dir, args.imag_dir, norm=args.norm_type)
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
+                    num_workers=4, pin_memory=True)
 
-
-# ===============================
-# Train Function
-# ===============================
-def train_diffusion_complex(real_dir, imag_dir, epochs=200, batch_size=8, lr=1e-4,
-                            timesteps=500, base_ch=64, ckpt_dir="checkpoints_complex_v2",
-                            device="cuda", save_interval=20, norm_type="tanh",
-                            lambda_freq=1.0, lambda_phase=1.0,
-                            resume_ckpt=None):
-    os.makedirs(ckpt_dir, exist_ok=True)
-    dataset = ComplexWaveletDataset(real_dir, imag_dir, norm_type)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-
-    in_ch = out_ch = 2
-    model = UNet(in_ch, out_ch, base_ch, [1, 2, 4, 8]).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    model = UNet(in_ch=2, out_ch=2, base_ch=args.base_ch,
+                 ch_mult=tuple(args.ch_mult), conditional=False).to(device)
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs, eta_min=1e-6)
 
     mse = nn.MSELoss()
-    freq_loss_fn = FrequencyAwareLoss()
-    diffusion = Diffusion(timesteps, device)
+    l1  = nn.L1Loss()
+    freq_loss = LogFreqAwareMSE()
+    wave_perc = WaveletPerceptualLoss()
+    diffusion = Diffusion(args.timesteps, device)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
 
-    start_epoch = 0
+    global_stats = None
+    if args.norm_type == "global_z":
+        mu  = args.global_mu  if args.global_mu  is not None else [0.0, 0.0]
+        std = args.global_std if args.global_std is not None else [1.0, 1.0]
+        global_stats = {"mu": mu, "std": std}
 
-    # ✅ Resume 기능
-    if resume_ckpt is not None and os.path.exists(resume_ckpt):
-        ckpt = torch.load(resume_ckpt, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        start_epoch = ckpt.get("epoch", 0)
-        print(f"✅ Checkpoint loaded from {resume_ckpt} (epoch {start_epoch})")
-
-    for epoch in range(start_epoch, epochs):
-        total_loss = 0.0
+    global_step = 0
+    for ep in range(1, args.epochs+1):
         model.train()
+        total_loss = 0.0
+        for step, x0 in enumerate(dl, start=1):
+            global_step += 1
+            x0 = x0.to(device, non_blocking=True)
+            if args.norm_type == "global_z" and global_stats is not None:
+                x0 = norm_z_global(x0, global_stats["mu"], global_stats["std"])
 
-        for batch in dataloader:
-            x = batch.to(device)
-            t = torch.randint(0, diffusion.timesteps, (x.shape[0],), device=device).long()
-            noisy, noise = diffusion.add_noise(x, t)
-            pred = model(noisy, t)
+            t = torch.randint(0, diffusion.timesteps, (x0.size(0),), device=device).long()
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                x_t, noise = diffusion.add_noise(x0, t)
+                pred_noise = model(x_t, t)
+                a_hat_t = diffusion.alpha_hat[t].view(-1,1,1,1)
+                x0_pred = predict_x0_from_noise(x_t, pred_noise, a_hat_t)
 
-            # 손실 계산
-            loss_mse = mse(pred, noise)
-            loss_freq = freq_loss_fn(pred, noise)
-            loss_phase = phase_consistency_loss(pred, noise)
-            loss = loss_mse + lambda_freq * loss_freq + lambda_phase * loss_phase
+                loss_noise = mse(pred_noise, noise)
+                loss_x0_l1 = l1(x0_pred, x0)
+                loss_x0_si = scale_invariant_mse(x0_pred, x0)
+                loss_x0    = 0.5 * (loss_x0_l1 + loss_x0_si)
+                loss_phase = circular_mse_phase(x0_pred, x0)
+                loss_freq  = freq_loss(x0_pred, x0)
+                loss_perc  = wave_perc(x0_pred, x0)
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # ✅ Gradient clipping
-            optimizer.step()
+                mean_pred, mean_gt = x0_pred.mean(), x0.mean()
+                std_pred, std_gt   = x0_pred.std(),  x0.std()
+                loss_scale = (mean_pred - mean_gt).abs() + (std_pred - std_gt).abs()
+
+                loss = (args.l_noise * loss_noise
+                        + args.l_x0 * loss_x0
+                        + args.l_phase * loss_phase
+                        + args.l_freq * loss_freq
+                        + args.l_perc * loss_perc
+                        + 0.05 * loss_scale)
+
+            optim.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(optim)
+            scaler.update()
 
             total_loss += loss.item()
 
-        scheduler.step()
-        avg_loss = total_loss / len(dataloader)
-        print(f"[{epoch+1}/{epochs}] Loss={avg_loss:.6f} | LR={scheduler.get_last_lr()[0]:.6e}")
+            print(f"[Epoch {ep:03d} | Step {step:04d}] "
+                    f"loss={loss.item():.6f} | noise={loss_noise.item():.6f} | "
+                    f"x0={loss_x0.item():.6f} | phase={loss_phase.item():.6f} | "
+                    f"freq={loss_freq.item():.6f} | perc={loss_perc.item():.6f}")
 
-        # ✅ Save checkpoint
-        if (epoch + 1) % save_interval == 0 or (epoch + 1) == epochs:
-            ckpt_path = os.path.join(ckpt_dir, f"ckpt_epoch_{epoch+1:04d}.pt")
+            # === TensorBoard write ===
+            writer.add_scalar("train/loss_total", loss.item(), global_step)
+            writer.add_scalar("train/loss_noise", loss_noise.item(), global_step)
+            writer.add_scalar("train/loss_x0", loss_x0.item(), global_step)
+            writer.add_scalar("train/loss_phase", loss_phase.item(), global_step)
+            writer.add_scalar("train/loss_freq", loss_freq.item(), global_step)
+            writer.add_scalar("train/loss_perc", loss_perc.item(), global_step)
+
+        avg_loss = total_loss / len(dl)
+        print(f"[Epoch {ep}] Avg Loss: {avg_loss:.6f}")
+        writer.add_scalar("train/epoch_avg_loss", avg_loss, ep)
+        sched.step()
+
+        # === Save checkpoint ===
+        if ep % args.save_interval == 0 or ep == args.epochs:
+            cfg = dict(vars(args))
+            if global_stats is not None:
+                cfg["norm_mu"] = global_stats["mu"]
+                cfg["norm_std"] = global_stats["std"]
             torch.save({
-                "epoch": epoch + 1,
+                "epoch": ep,
                 "model_state_dict": model.state_dict(),
-                "loss": avg_loss,
-                "lambda_freq": lambda_freq,
-                "lambda_phase": lambda_phase,
-                "norm_type": norm_type,
-                "type": "complex_wavelet_v2"
-            }, ckpt_path)
-            print(f"✅ Saved checkpoint: {ckpt_path}")
+                "cfg": cfg
+            }, os.path.join(args.ckpt_dir, f"ckpt_ep{ep:04d}.pt"))
 
-    print("🎯 Training Complete!")
-    return model, diffusion
-
-
-# ===============================
-# Main Entry
-# ===============================
+# -----------------------------
+# CLI
+# -----------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--real_dir", type=str, required=True)
-    parser.add_argument("--imag_dir", type=str, required=True)
-    parser.add_argument("--ckpt_dir", type=str, default="checkpoints_complex_v2")
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--timesteps", type=int, default=500)
-    parser.add_argument("--base_ch", type=int, default=64)
-    parser.add_argument("--save_interval", type=int, default=20)
-    parser.add_argument("--norm_type", type=str, default="tanh", choices=["tanh", "zscore", "0to1"])
-    parser.add_argument("--lambda_freq", type=float, default=1.0)
-    parser.add_argument("--lambda_phase", type=float, default=1.0)
-    parser.add_argument("--resume_ckpt", type=str, default=None)
-    args = parser.parse_args()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    train_diffusion_complex(
-        real_dir=args.real_dir,
-        imag_dir=args.imag_dir,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        timesteps=args.timesteps,
-        base_ch=args.base_ch,
-        ckpt_dir=args.ckpt_dir,
-        device=device,
-        save_interval=args.save_interval,
-        norm_type=args.norm_type,
-        lambda_freq=args.lambda_freq,
-        lambda_phase=args.lambda_phase,
-        resume_ckpt=args.resume_ckpt
-    )
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--real_dir", type=str, required=True)
+    ap.add_argument("--imag_dir", type=str, required=True)
+    ap.add_argument("--ckpt_dir", type=str, default="ckpts_v6")
+    ap.add_argument("--epochs", type=int, default=200)
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--timesteps", type=int, default=1000)
+    ap.add_argument("--base_ch", type=int, default=64)
+    ap.add_argument("--ch_mult", type=int, nargs="+", default=[1,2,4,8])
+    ap.add_argument("--save_interval", type=int, default=20)
+    ap.add_argument("--norm_type", type=str, default="per_scale_z",
+                    choices=["per_scale_z","zscore","global_z","none"])
+    ap.add_argument("--amp", action="store_true")
+    ap.add_argument("--global_mu", type=float, nargs=2, default=None)
+    ap.add_argument("--global_std", type=float, nargs=2, default=None)
+    ap.add_argument("--l_noise", type=float, default=1.0)
+    ap.add_argument("--l_x0",    type=float, default=1.0)
+    ap.add_argument("--l_phase", type=float, default=0.5)
+    ap.add_argument("--l_freq",  type=float, default=0.5)
+    ap.add_argument("--l_perc",  type=float, default=0.3)
+    args = ap.parse_args()
+    train(args)
