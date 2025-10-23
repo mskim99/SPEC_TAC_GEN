@@ -4,11 +4,10 @@ import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, DataLoader
-import pywt
 from model import UNet
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 
 # -----------------------------
 # Global normalization utils
@@ -102,8 +101,9 @@ class WaveletComplexDataset(Dataset):
     def __getitem__(self, idx):
         r = np.load(self.real_files[idx]).astype(np.float32)
         g = np.load(self.imag_files[idx]).astype(np.float32)
-        if r.ndim == 3: r = r[0]
-        if g.ndim == 3: g = g[0]
+        r = r.squeeze()
+        g = g.squeeze()
+        assert r.ndim == 2 and g.ndim == 2, f"Bad shape: real={r.shape}, imag={g.shape}"
         r, g = self._normalize_pair(r, g)
         x = np.stack([r, g], axis=0)
         return torch.from_numpy(x)
@@ -177,8 +177,17 @@ def train(args):
 
     global_stats = None
     if args.norm_type == "global_z":
-        mu  = args.global_mu  if args.global_mu  is not None else [0.0, 0.0]
-        std = args.global_std if args.global_std is not None else [1.0, 1.0]
+        real_files = ds.real_files
+        imag_files = ds.imag_files
+        mus, stds = [], []
+        for rfile, ifile in zip(real_files, imag_files):
+            r = np.load(rfile).astype(np.float32)
+            i = np.load(ifile).astype(np.float32)
+            mus.append([r.mean(), i.mean()])
+            stds.append([r.std(), i.std()])
+        mu = np.mean(mus, axis=0).tolist()
+        std = np.mean(stds, axis=0).tolist()
+        print(f"[INFO] Computed norm_mu={mu}, norm_std={std}")
         global_stats = {"mu": mu, "std": std}
 
     global_step = 0
@@ -272,8 +281,8 @@ if __name__ == "__main__":
     ap.add_argument("--norm_type", type=str, default="per_scale_z",
                     choices=["per_scale_z","zscore","global_z","none"])
     ap.add_argument("--amp", action="store_true")
-    ap.add_argument("--global_mu", type=float, nargs=2, default=None)
-    ap.add_argument("--global_std", type=float, nargs=2, default=None)
+    # ap.add_argument("--global_mu", type=float, nargs=2, default=None)
+    # ap.add_argument("--global_std", type=float, nargs=2, default=None)
     ap.add_argument("--l_noise", type=float, default=1.0)
     ap.add_argument("--l_x0",    type=float, default=1.0)
     ap.add_argument("--l_phase", type=float, default=0.5)
