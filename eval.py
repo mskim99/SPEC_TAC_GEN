@@ -14,6 +14,14 @@ try:
 except Exception:
     torch = None
 
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+
+def _per_scale_z(x):
+    mu = x.mean(axis=1, keepdims=True)
+    std = x.std(axis=1, keepdims=True) + 1e-8
+    return (x - mu) / std
+
 # === 기본 지표 ===
 def mse(gt, pred): return np.mean((gt - pred) ** 2)
 def mae(gt, pred): return np.mean(np.abs(gt - pred))
@@ -113,13 +121,18 @@ def evaluate_class(gt_files, gen_files, max_pairs=None, class_name="", is_phase=
     count = 0
     for gi, gt_path in enumerate(tqdm(gt_files, desc=f"Evaluating {class_name}")):
         gt = np.load(gt_path)
+        gt = _per_scale_z(gt)
         for gj, gen_path in enumerate(gen_files):
             gen = np.load(gen_path)
 
             # ==== DEBUG: print raw stats ====
+            '''
             if gi == 0 and gj == 0:
                 print(f"[DEBUG] GT raw: mean={gt.mean():.3f}, std={gt.std():.3f}")
                 print(f"[DEBUG] GEN raw(before denorm): mean={gen.mean():.3f}, std={gen.std():.3f}")
+            '''
+            # GEN에도 GT와 동일한 per_scale_z 정규화를 적용합니다.
+            gen = _per_scale_z(gen)
 
             # ---- denorm ----
             # gen = _denorm_if_needed(gen, denorm_stats)
@@ -134,8 +147,8 @@ def evaluate_class(gt_files, gen_files, max_pairs=None, class_name="", is_phase=
             # if gi == 0 and gj == 0:
             # diff_std = abs(gt.std() - gen.std())
             # ratio = gt.std() / (gen.std() + 1e-8)
-            print(f"[DEBUG] GT mean={gt.mean():.3f}, std={gt.std():.3f}")
-            print(f"[DEBUG] After denorm/affine: GEN mean={gen.mean():.3f}, std={gen.std():.3f}")
+            # print(f"[DEBUG] GT mean={gt.mean():.3f}, std={gt.std():.3f}")
+            # print(f"[DEBUG] After denorm/affine: GEN mean={gen.mean():.3f}, std={gen.std():.3f}")
             # print(f"[DEBUG] STD ratio (GT/GEN)={ratio:.3f}, abs diff={diff_std:.3f}")
             # if ratio > 10 or ratio < 0.1:
                 # print("⚠️ [WARNING] Possible normalization mismatch between GT and GEN!")
@@ -183,6 +196,8 @@ if __name__ == "__main__":
     parser.add_argument("--is_phase", type=bool, default=False)
     parser.add_argument("--affine_fix", action="store_true")
     parser.add_argument("--complex_affine_fix", action="store_true", help="복소 회전+스케일 보정")
+    parser.add_argument("--suffix", type=str, default="_real.npy",
+                        help="Suffix for generated files (e.g., '_real.npy', '_imag.npy')")
     args = parser.parse_args()
 
     # ==== DEBUG: Load ckpt normalization stats ====
@@ -198,7 +213,9 @@ if __name__ == "__main__":
             print("⚠️ [WARNING] norm_mu/std not found in ckpt.cfg")
 
     gt_files = sorted(glob(os.path.join(args.gt_root, "*.npy")))
-    gen_files = sorted(glob(os.path.join(args.gen_root, "*_real.npy")))
+    gen_pattern = f"*{args.suffix}"
+    gen_files = sorted(glob(os.path.join(args.gen_root, gen_pattern)))
+    print(f"[INFO] Evaluating GT ({len(gt_files)} files) vs GEN ({len(gen_files)} files matching '{gen_pattern}')")
 
     print(f"[DEBUG] Total files: GT={len(gt_files)}, GEN={len(gen_files)}")
     results = evaluate_class(gt_files, gen_files, class_name="debug_eval",

@@ -4,7 +4,8 @@ import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, DataLoader
-from model import UNet
+from model_complex import UNet
+import json
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "4"
@@ -36,11 +37,33 @@ def scale_invariant_mse(pred, gt, eps=1e-8):
         total += torch.mean((alpha * p - g) ** 2)
     return total / B
 
-# -----------------------------
-# TV loss
-# -----------------------------
-def tv_loss(x):  # x:(B,2,H,W)
-    return (x[:,:,:,1:] - x[:,:,:,:-1]).abs().mean() + (x[:,:,1:,:] - x[:,:,:-1,:]).abs().mean()
+
+def affine_invariant_mse(pred, gt, eps=1e-8):
+    """ Affine-invariant MSE (Vectorized) """
+    B = pred.shape[0]
+    # 1. Flatten: (B, C, H, W) -> (B, N)
+    p = pred.view(B, -1)
+    g = gt.view(B, -1)
+
+    # 2. Calculate means: (B, N) -> (B,)
+    p_mean = p.mean(dim=1)
+    g_mean = g.mean(dim=1)
+
+    # 3. Calculate dot products: (B, N) * (B, N) -> (B,)
+    p_dot_g = torch.sum(p * g, dim=1)
+    p_dot_p = torch.sum(p * p, dim=1)
+
+    # 4. Calculate regression coefficients a, b: (B,)
+    a = p_dot_g / (p_dot_p + eps)
+    b = g_mean - a * p_mean
+
+    # 5. Apply transform: a*p + b
+    # (B, 1) * (B, N) + (B, 1) -> (B, N)
+    p_transformed = a.view(B, 1) * p + b.view(B, 1)
+
+    # 6. Calculate loss per sample and average over batch
+    loss_per_sample = torch.mean((p_transformed - g) ** 2, dim=1)
+    return torch.mean(loss_per_sample)
 
 # -----------------------------
 # Diffusion
@@ -169,7 +192,7 @@ def train(args):
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs, eta_min=1e-6)
 
     mse = nn.MSELoss()
-    l1  = nn.L1Loss()
+    # l1  = nn.L1Loss() # <-- 2, 4번 요청에 의해 더 이상 필요하지 않음
     freq_loss = LogFreqAwareMSE()
     wave_perc = WaveletPerceptualLoss()
     diffusion = Diffusion(args.timesteps, device)
@@ -177,17 +200,20 @@ def train(args):
 
     global_stats = None
     if args.norm_type == "global_z":
-        real_files = ds.real_files
-        imag_files = ds.imag_files
-        mus, stds = [], []
-        for rfile, ifile in zip(real_files, imag_files):
-            r = np.load(rfile).astype(np.float32)
-            i = np.load(ifile).astype(np.float32)
-            mus.append([r.mean(), i.mean()])
-            stds.append([r.std(), i.std()])
-        mu = np.mean(mus, axis=0).tolist()
-        std = np.mean(stds, axis=0).tolist()
-        print(f"[INFO] Computed norm_mu={mu}, norm_std={std}")
+        if args.stats_file is None:
+            raise ValueError("norm_type='global_z' requires --stats_file argument.")
+        if not os.path.exists(args.stats_file):
+            raise FileNotFoundError(f"Stats file not found: {args.stats_file}. "
+                                    "Please run compute_stats.py first.")
+
+        print(f"[INFO] Loading global stats from {args.stats_file}")
+        with open(args.stats_file, 'r') as f:
+            stats = json.load(f)
+
+        mu = stats["mu"]
+        std = stats["std"]
+
+        print(f"[INFO] Loaded norm_mu={mu}, norm_std={std}")
         global_stats = {"mu": mu, "std": std}
 
     global_step = 0
@@ -208,23 +234,16 @@ def train(args):
                 x0_pred = predict_x0_from_noise(x_t, pred_noise, a_hat_t)
 
                 loss_noise = mse(pred_noise, noise)
-                loss_x0_l1 = l1(x0_pred, x0)
-                loss_x0_si = scale_invariant_mse(x0_pred, x0)
-                loss_x0    = 0.5 * (loss_x0_l1 + loss_x0_si)
+                loss_x0_ai = affine_invariant_mse(x0_pred, x0)
                 loss_phase = circular_mse_phase(x0_pred, x0)
                 loss_freq  = freq_loss(x0_pred, x0)
                 loss_perc  = wave_perc(x0_pred, x0)
 
-                mean_pred, mean_gt = x0_pred.mean(), x0.mean()
-                std_pred, std_gt   = x0_pred.std(),  x0.std()
-                loss_scale = (mean_pred - mean_gt).abs() + (std_pred - std_gt).abs()
-
                 loss = (args.l_noise * loss_noise
-                        + args.l_x0 * loss_x0
+                        + args.l_ai * loss_x0_ai
                         + args.l_phase * loss_phase
                         + args.l_freq * loss_freq
-                        + args.l_perc * loss_perc
-                        + 0.05 * loss_scale)
+                        + args.l_perc * loss_perc)
 
             optim.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -233,15 +252,17 @@ def train(args):
 
             total_loss += loss.item()
 
+            # --- 4번 요청: print문 수정 ('x0=' -> 'ai=') ---
             print(f"[Epoch {ep:03d} | Step {step:04d}] "
                     f"loss={loss.item():.6f} | noise={loss_noise.item():.6f} | "
-                    f"x0={loss_x0.item():.6f} | phase={loss_phase.item():.6f} | "
+                    f"ai={loss_x0_ai.item():.6f} | phase={loss_phase.item():.6f} | "
                     f"freq={loss_freq.item():.6f} | perc={loss_perc.item():.6f}")
 
             # === TensorBoard write ===
             writer.add_scalar("train/loss_total", loss.item(), global_step)
             writer.add_scalar("train/loss_noise", loss_noise.item(), global_step)
-            writer.add_scalar("train/loss_x0", loss_x0.item(), global_step)
+            # --- 4번 요청: tb 로깅 수정 ('loss_x0' -> 'loss_ai') ---
+            writer.add_scalar("train/loss_ai", loss_x0_ai.item(), global_step)
             writer.add_scalar("train/loss_phase", loss_phase.item(), global_step)
             writer.add_scalar("train/loss_freq", loss_freq.item(), global_step)
             writer.add_scalar("train/loss_perc", loss_perc.item(), global_step)
@@ -280,11 +301,11 @@ if __name__ == "__main__":
     ap.add_argument("--save_interval", type=int, default=20)
     ap.add_argument("--norm_type", type=str, default="per_scale_z",
                     choices=["per_scale_z","zscore","global_z","none"])
+    ap.add_argument("--stats_file", type=str, default=None,
+                    help="Path to precomputed stats.json file (required for norm_type='global_z')")
     ap.add_argument("--amp", action="store_true")
-    # ap.add_argument("--global_mu", type=float, nargs=2, default=None)
-    # ap.add_argument("--global_std", type=float, nargs=2, default=None)
     ap.add_argument("--l_noise", type=float, default=1.0)
-    ap.add_argument("--l_x0",    type=float, default=1.0)
+    ap.add_argument("--l_ai",    type=float, default=1.0)
     ap.add_argument("--l_phase", type=float, default=0.5)
     ap.add_argument("--l_freq",  type=float, default=0.5)
     ap.add_argument("--l_perc",  type=float, default=0.3)
