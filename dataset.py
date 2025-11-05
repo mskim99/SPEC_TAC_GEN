@@ -22,7 +22,7 @@ class SpectrogramDataset(Dataset):
 
     def __getitem__(self, idx):
         spec = np.load(self.files[idx])  # (129,376)
-
+        '''
         if self.is_phase:
             # phase ∈ [-π, π]
             phase = spec
@@ -34,5 +34,7 @@ class SpectrogramDataset(Dataset):
             spec_norm = np.expand_dims(spec_norm, axis=0)
 
         spec_norm = torch.tensor(spec_norm, dtype=torch.float32)
+        '''
+        spec = torch.tensor(spec, dtype=torch.float32)
         cond_idx = self.cond2idx[self.conditions[idx]]  # int label
-        return spec_norm, cond_idx
+        return spec, cond_idx
