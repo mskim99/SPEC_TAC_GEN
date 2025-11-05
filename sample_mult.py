@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 
 from typing import Optional, Tuple
 from torch.utils.tensorboard import SummaryWriter
-# from model import UNet
 from model_complex import UNet
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -315,7 +314,7 @@ def main(args):
             if samples_generated >= total_samples_needed:
                 break  # 요청한 샘플 수를 모두 채웠으면 중지
 
-            tag = "sample{:03d}".format(samples_generated)
+            tag = "sample_{:03d}".format(samples_generated)
             print(f"   ... 저장 중: {tag} (배치 {i + 1}, 샘플 {j + 1})")
 
             # save npy (원본 데이터 저장)

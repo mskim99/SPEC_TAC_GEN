@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 from model_complex import UNet
 import json
 
@@ -64,6 +65,24 @@ def affine_invariant_mse(pred, gt, eps=1e-8):
     # 6. Calculate loss per sample and average over batch
     loss_per_sample = torch.mean((p_transformed - g) ** 2, dim=1)
     return torch.mean(loss_per_sample)
+
+# [NEW] Spectral-domain magnitude loss
+def spectral_loss(pred, gt, eps=1e-8):
+    P = torch.fft.rfft2(pred, norm='ortho')
+    G = torch.fft.rfft2(gt, norm='ortho')
+    mag_p, mag_g = torch.abs(P), torch.abs(G)
+    return torch.mean(torch.abs(mag_p - mag_g))
+
+def multiscale_mse(pred, gt):
+    loss = 0.0
+    for scale in [1, 0.5, 0.25]:
+        if scale < 1.0:
+            p = F.interpolate(pred, scale_factor=scale, mode="bilinear", align_corners=False)
+            g = F.interpolate(gt, scale_factor=scale, mode="bilinear", align_corners=False)
+        else:
+            p, g = pred, gt
+        loss += F.mse_loss(p, g)
+    return loss / 3.0
 
 # -----------------------------
 # Diffusion
@@ -159,13 +178,27 @@ class WaveletPerceptualLoss(nn.Module):
             loss = loss + torch.mean(torch.abs(pmag - gmag))
         return loss / len(self.scales)
 
+
 class LogFreqAwareMSE(nn.Module):
     def forward(self, pred, target):
-        B,C,H,W = pred.shape
-        f = torch.arange(1, H+1, device=pred.device).float()
-        w = torch.log(1.0 + f) / torch.log(torch.tensor(1.0 + H, device=pred.device))
-        w = w.view(1,1,H,1)
-        return torch.mean(w * (pred - target)**2)
+        B, C, H, W = pred.shape
+        f = torch.arange(1, H + 1, device=pred.device).float()
+
+        # --- [수정된 부분] ---
+        # 원본 (고주파 가중):
+        # w = torch.log(1.0 + f) / torch.log(torch.tensor(1.0 + H, device=pred.device))
+
+        # 수정 (저주파 가중):
+        # f가 1일 때(저주파) 가중치가 높고, f가 H일 때(고주파) 가중치가 낮아지도록 뒤집습니다.
+        w = 1.0 / (f + 1e-8)
+        # (또는) w = torch.log(1.0 + (H - f + 1))
+
+        # 가중치를 [0, 1] 범위로 정규화 (선택 사항이지만 안정적)
+        w = (w - w.min()) / (w.max() - w.min() + 1e-8)
+        # --- [수정 끝] ---
+
+        w = w.view(1, 1, H, 1)
+        return torch.mean(w * (pred - target) ** 2)
 
 # -----------------------------
 # DDPM helpers
@@ -191,8 +224,8 @@ def train(args):
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs, eta_min=1e-6)
 
-    mse = nn.MSELoss()
-    # l1  = nn.L1Loss() # <-- 2, 4번 요청에 의해 더 이상 필요하지 않음
+    # mse = nn.MSELoss()
+    mse = nn.L1Loss()
     freq_loss = LogFreqAwareMSE()
     wave_perc = WaveletPerceptualLoss()
     diffusion = Diffusion(args.timesteps, device)
@@ -236,14 +269,18 @@ def train(args):
                 loss_noise = mse(pred_noise, noise)
                 loss_x0_ai = affine_invariant_mse(x0_pred, x0)
                 loss_phase = circular_mse_phase(x0_pred, x0)
-                loss_freq  = freq_loss(x0_pred, x0)
-                loss_perc  = wave_perc(x0_pred, x0)
+                loss_freq = freq_loss(x0_pred, x0)
+                loss_perc = wave_perc(x0_pred, x0)
+                loss_spec = spectral_loss(x0_pred, x0)  # [NEW]
+                loss_ms = multiscale_mse(pred_noise, noise)  # [NEW]
 
                 loss = (args.l_noise * loss_noise
                         + args.l_ai * loss_x0_ai
                         + args.l_phase * loss_phase
                         + args.l_freq * loss_freq
-                        + args.l_perc * loss_perc)
+                        + args.l_perc * loss_perc
+                        + args.l_spec * loss_spec  # [NEW]
+                        + args.l_ms * loss_ms)  # [NEW]
 
             optim.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -256,7 +293,8 @@ def train(args):
             print(f"[Epoch {ep:03d} | Step {step:04d}] "
                     f"loss={loss.item():.6f} | noise={loss_noise.item():.6f} | "
                     f"ai={loss_x0_ai.item():.6f} | phase={loss_phase.item():.6f} | "
-                    f"freq={loss_freq.item():.6f} | perc={loss_perc.item():.6f}")
+                    f"freq={loss_freq.item():.6f} | perc={loss_perc.item():.6f} | "
+                    f"spec={loss_spec.item():.6f} | ms={loss_ms.item():.6f} | ")
 
             # === TensorBoard write ===
             writer.add_scalar("train/loss_total", loss.item(), global_step)
@@ -266,6 +304,8 @@ def train(args):
             writer.add_scalar("train/loss_phase", loss_phase.item(), global_step)
             writer.add_scalar("train/loss_freq", loss_freq.item(), global_step)
             writer.add_scalar("train/loss_perc", loss_perc.item(), global_step)
+            writer.add_scalar("train/loss_spec", loss_spec.item(), global_step)
+            writer.add_scalar("train/loss_ms", loss_ms.item(), global_step)
 
         avg_loss = total_loss / len(dl)
         print(f"[Epoch {ep}] Avg Loss: {avg_loss:.6f}")
@@ -309,5 +349,7 @@ if __name__ == "__main__":
     ap.add_argument("--l_phase", type=float, default=0.5)
     ap.add_argument("--l_freq",  type=float, default=0.5)
     ap.add_argument("--l_perc",  type=float, default=0.3)
+    ap.add_argument("--l_spec", type=float, default=0.3, help="weight for spectral loss")
+    ap.add_argument("--l_ms", type=float, default=0.2, help="weight for multiscale noise loss")
     args = ap.parse_args()
     train(args)
