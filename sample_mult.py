@@ -307,7 +307,7 @@ def main(args):
             ddim_steps=args.ddim_steps,  # DDIM 인자 전달
             eta=args.eta  # DDIM 인자 전달
         )
-        x = denorm_from_cfg(x, cfg)  # (B, 2, H, W)
+        # x = denorm_from_cfg(x, cfg)  # (B, 2, H, W)
 
         # 배치 루프: 생성된 B개의 샘플을 순회하며 저장
         for j in range(B):

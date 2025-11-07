@@ -185,7 +185,7 @@ class UNet(nn.Module):
             self.dec_blocks.append(ComplexBlock(out_c * 2, out_c, k=1, s=1, p=0, groups=groups))
 
         # [NEW] Align head (전역 위상/스케일 보정)
-        self.align = ComplexAlignHead(base_ch * ch_mult[0])
+        # self.align = ComplexAlignHead(base_ch * ch_mult[0])
 
         # 독립적인 r, i conv 대신 ComplexConv2d 사용
         self.out_conv = ComplexConv2d(base_ch * ch_mult[0], 1, k=1, s=1, p=0, bias=False)
@@ -238,7 +238,7 @@ class UNet(nn.Module):
             xr, xi = self.dec_blocks[i](xr, xi)
 
         # Align head (전역 위상/스케일 보정)
-        xr, xi, ar, ai = self.align(xr, xi)
+        # xr, xi, ar, ai = self.align(xr, xi)
 
         # out_conv (ComplexConv2d)를 통해 yr, yi 계산
         yr, yi = self.out_conv(xr, xi)
@@ -247,4 +247,7 @@ class UNet(nn.Module):
         # 출력 크기 보정(필요 시)
         if y.shape[2:] != (H, W):
             y = F.interpolate(y, size=(H, W), mode="bilinear", align_corners=False)
+
+        y = torch.tanh(y)
+
         return y
