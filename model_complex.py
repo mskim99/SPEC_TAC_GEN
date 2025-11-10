@@ -48,12 +48,17 @@ class ComplexBlock(nn.Module):  # [NEW] Conv -> GN -> Act
         super().__init__()
         self.conv = ComplexConv2d(in_ch, out_ch, k=k, s=s, p=p, bias=False, dilation=dilation)
         self.norm = ComplexGroupNorm(groups, out_ch)
-        self.act = ModReLU()
+        # self.act = ModReLU()
+        self.act = nn.SiLU()
 
     def forward(self, xr, xi):
         xr, xi = self.conv(xr, xi)
         xr, xi = self.norm(xr, xi)
-        xr, xi = self.act(xr, xi)
+
+        # xr, xi = self.act(xr, xi)
+        xr = self.act(xr)
+        xi = self.act(xi)
+
         return xr, xi
 
 
@@ -98,10 +103,11 @@ class ComplexASPP(nn.Module):
             # dilated conv 효과: padding=r, kernel=3 으로 receptive field 증가
             yr, yi = b.conv(xr, xi)  # Conv만 먼저
             yr, yi = b.norm(yr, yi)
-            yr, yi = b.act(yr, yi)
-            outs_r.append(yr);
+            yr = b.act(yr)
+            yi = b.act(yi)
+            outs_r.append(yr)
             outs_i.append(yi)
-        xr = torch.cat(outs_r, dim=1);
+        xr = torch.cat(outs_r, dim=1)
         xi = torch.cat(outs_i, dim=1)
         xr, xi = self.proj(xr, xi)
         return xr, xi
@@ -248,6 +254,6 @@ class UNet(nn.Module):
         if y.shape[2:] != (H, W):
             y = F.interpolate(y, size=(H, W), mode="bilinear", align_corners=False)
 
-        y = torch.tanh(y)
+        # y = torch.tanh(y)
 
         return y

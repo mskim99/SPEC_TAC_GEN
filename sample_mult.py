@@ -138,7 +138,7 @@ def sample_complex(model,
                    save_every=0,
                    out_dir=None,
                    tag_prefix="sample",
-                   tb_writer=None,  # type: Optional[SummaryWriter]
+                   # tb_writer=None,  # type: Optional[SummaryWriter]
                    tb_every=0,
                    noise_scale=1.0,
                    # --- [수정된 부분] ---
@@ -186,12 +186,14 @@ def sample_complex(model,
             )
 
             # tensorboard intermediates (로깅 시점 t = t_current 사용)
+            '''
             if (tb_writer is not None) and tb_every and (t_current % tb_every == 0 or t_prev == -1):
                 r = _to_img(x[0, 0:1])
                 im = _to_img(x[0, 1:2])
                 global_step = diffusion.timesteps - 1 - t_current
                 tb_writer.add_image("{}/real_t{:04d}".format(tag_prefix, t_current), r, global_step=global_step)
                 tb_writer.add_image("{}/imag_t{:04d}".format(tag_prefix, t_current), im, global_step=global_step)
+            '''
 
     else:
         # 기존 DDPM 샘플링
@@ -278,7 +280,7 @@ def main(args):
     shape = (B, 2, H, W)
 
     # TensorBoard writer (optional)
-    writer = SummaryWriter(log_dir=os.path.join(args.out_dir, "tb")) if args.tensorboard else None
+    # writer = SummaryWriter(log_dir=os.path.join(args.out_dir, "tb")) if args.tensorboard else None
 
     # num_samples 만큼 루프를 도는 대신, 필요한 배치 수 만큼 루프를 돌고
     # 각 배치의 모든 샘플을 저장합니다.
@@ -300,14 +302,14 @@ def main(args):
             save_every=args.save_every,
             out_dir=args.out_dir,
             tag_prefix=batch_tag,  # 중간 로그용 태그
-            tb_writer=writer,
+            # tb_writer=writer,
             tb_every=args.tb_every,
             noise_scale=args.noise_scale,
             use_ddim=use_ddim,  # DDIM 인자 전달
             ddim_steps=args.ddim_steps,  # DDIM 인자 전달
             eta=args.eta  # DDIM 인자 전달
         )
-        # x = denorm_from_cfg(x, cfg)  # (B, 2, H, W)
+        x = denorm_from_cfg(x, cfg)  # (B, 2, H, W)
 
         # 배치 루프: 생성된 B개의 샘플을 순회하며 저장
         for j in range(B):
@@ -332,27 +334,27 @@ def main(args):
 
             # --- [수정된 부분] ---
             # 문제 2 수정: TB 최종 이미지 저장 시 [-1, 1] 클리핑 제거
-            if writer is not None:
-                r = torch.from_numpy(real).unsqueeze(0)  # (1,H,W)
-                im = torch.from_numpy(imag).unsqueeze(0)
+            # if writer is not None:
+            r = torch.from_numpy(real).unsqueeze(0)  # (1,H,W)
+            im = torch.from_numpy(imag).unsqueeze(0)
 
-                # [-1, 1] 클리핑 대신 동적 범위 정규화
-                r_min, r_max = r.min(), r.max()
-                im_min, im_max = im.min(), im.max()
+            # [-1, 1] 클리핑 대신 동적 범위 정규화
+            r_min, r_max = r.min(), r.max()
+            im_min, im_max = im.min(), im.max()
 
-                r = (r - r_min) / (r_max - r_min + 1e-8)
-                im = (im - im_min) / (im_max - im_min + 1e-8)
+            r = (r - r_min) / (r_max - r_min + 1e-8)
+            im = (im - im_min) / (im_max - im_min + 1e-8)
 
-                writer.add_image("{}/final_real".format(tag), r, global_step=samples_generated)
-                writer.add_image("{}/final_imag".format(tag), im, global_step=samples_generated)
+            # writer.add_image("{}/final_real".format(tag), r, global_step=samples_generated)
+            # writer.add_image("{}/final_imag".format(tag), im, global_step=samples_generated)
 
             samples_generated += 1
 
         if samples_generated >= total_samples_needed:
             break
 
-    if writer is not None:
-        writer.close()
+    # if writer is not None:
+        # writer.close()
 
     print(f"\n✅ 샘플링 완료 — {samples_generated}개의 샘플이 {args.out_dir}에 저장되었습니다.")
 
@@ -371,7 +373,7 @@ if __name__ == "__main__":
     p.add_argument("--timesteps", type=int, default=None, help="override; else use ckpt cfg")
     p.add_argument("--save_every", type=int, default=0, help="save x_t every N steps (0=off)")
     p.add_argument("--tb_every", type=int, default=0, help="TensorBoard image log every N steps (0=off)")
-    p.add_argument("--tensorboard", action="store_true", help="enable TensorBoard logging")
+    # p.add_argument("--tensorboard", action="store_true", help="enable TensorBoard logging")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--noise_scale", type=float, default=1.0, help="extra noise temperature in reverse step")
     p.add_argument("--vmin", type=float, default=None, help="PNG 저장시 vmin (GT 최소값 넣으면 공정 비교)")
