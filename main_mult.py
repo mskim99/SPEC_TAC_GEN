@@ -267,6 +267,7 @@ def train(args):
                 x0_pred = predict_x0_from_noise(x_t, pred_noise, a_hat_t)
 
                 loss_noise = mse(pred_noise, noise)
+                loss_x0_l1 = mse(x0_pred, x0)
                 loss_x0_ai = affine_invariant_mse(x0_pred, x0)
                 loss_phase = circular_mse_phase(x0_pred, x0)
                 loss_freq = freq_loss(x0_pred, x0)
@@ -275,6 +276,7 @@ def train(args):
                 loss_ms = multiscale_mse(pred_noise, noise)  # [NEW]
 
                 loss = (args.l_noise * loss_noise
+                        + args.l_x0_l1 * loss_x0_l1
                         + args.l_ai * loss_x0_ai
                         + args.l_phase * loss_phase
                         + args.l_freq * loss_freq
@@ -292,6 +294,7 @@ def train(args):
             # --- 4번 요청: print문 수정 ('x0=' -> 'ai=') ---
             print(f"[Epoch {ep:03d} | Step {step:04d}] "
                     f"loss={loss.item():.6f} | noise={loss_noise.item():.6f} | "
+                    f"x0_l1={loss_x0_l1.item():.6f} | "
                     f"ai={loss_x0_ai.item():.6f} | phase={loss_phase.item():.6f} | "
                     f"freq={loss_freq.item():.6f} | perc={loss_perc.item():.6f} | "
                     f"spec={loss_spec.item():.6f} | ms={loss_ms.item():.6f} | ")
@@ -299,7 +302,7 @@ def train(args):
             # === TensorBoard write ===
             writer.add_scalar("train/loss_total", loss.item(), global_step)
             writer.add_scalar("train/loss_noise", loss_noise.item(), global_step)
-            # --- 4번 요청: tb 로깅 수정 ('loss_x0' -> 'loss_ai') ---
+            writer.add_scalar("train/loss_x0_l1", loss_x0_l1.item(), global_step)
             writer.add_scalar("train/loss_ai", loss_x0_ai.item(), global_step)
             writer.add_scalar("train/loss_phase", loss_phase.item(), global_step)
             writer.add_scalar("train/loss_freq", loss_freq.item(), global_step)
@@ -339,12 +342,13 @@ if __name__ == "__main__":
     ap.add_argument("--base_ch", type=int, default=64)
     ap.add_argument("--ch_mult", type=int, nargs="+", default=[1,2,4,8])
     ap.add_argument("--save_interval", type=int, default=20)
-    ap.add_argument("--norm_type", type=str, default="per_scale_z",
+    ap.add_argument("--norm_type", type=str, default="none",
                     choices=["per_scale_z","zscore","global_z","none"])
     ap.add_argument("--stats_file", type=str, default=None,
                     help="Path to precomputed stats.json file (required for norm_type='global_z')")
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--l_noise", type=float, default=1.0)
+    ap.add_argument("--l_x0_l1", type=float, default=0.0)
     ap.add_argument("--l_ai",    type=float, default=1.0)
     ap.add_argument("--l_phase", type=float, default=0.5)
     ap.add_argument("--l_freq",  type=float, default=0.5)

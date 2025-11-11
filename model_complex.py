@@ -68,19 +68,35 @@ class ComplexBlock(nn.Module):  # [NEW] Conv -> GN -> Act
 class ComplexDown(nn.Module):  # stride-2 복소 다운샘플
     def __init__(self, in_ch, out_ch, groups=8):
         super().__init__()
-        self.block = ComplexBlock(in_ch, out_ch, k=3, s=2, p=1, groups=groups)
+        # self.block = ComplexBlock(in_ch, out_ch, k=3, s=2, p=1, groups=groups) # s=2 (Case 1)
+        self.block = ComplexBlock(in_ch, out_ch, k=3, s=1, p=1, groups=groups) # s=1 (Case 2)
+        self.pool = nn.AvgPool2d(2) # (Case 2)
 
-    def forward(self, xr, xi): return self.block(xr, xi)
+    # def forward(self, xr, xi): return self.block(xr, xi) # (Case 1)
+
+    def forward(self, xr, xi):
+        # <<< [추가] 컨볼루션 전에 풀링 적용
+        xr = self.pool(xr)
+        xi = self.pool(xi)
+
+        return self.block(xr, xi)
 
 
 class ComplexUp(nn.Module):  # 업샘플 + 복소 컨볼루션
     def __init__(self, in_ch, out_ch, groups=8):
         super().__init__()
         self.conv = ComplexBlock(in_ch, out_ch, k=3, s=1, p=1, groups=groups)
+        self.upsample = nn.Upsample(mode='nearest', scale_factor=2) # Case 3
 
     def forward(self, xr, xi, size):
-        xr = F.interpolate(xr, size=size, mode="bilinear", align_corners=False)
-        xi = F.interpolate(xi, size=size, mode="bilinear", align_corners=False)
+        # (Case 1: mode="bilinear" & Case 2: mode="bicubic")
+        # xr = F.interpolate(xr, size=size, mode="bicubic", align_corners=False)
+        # xi = F.interpolate(xi, size=size, mode="bicubic", align_corners=False)
+
+        # Case 3
+        xr = self.upsample(xr)
+        xi = self.upsample(xi)
+
         return self.conv(xr, xi)
 
 
